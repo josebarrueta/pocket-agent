@@ -1,0 +1,7 @@
+node_modules/
+dist/
+config.json
+signal-cli-data/
+.env
+*.log
+.DS_Store

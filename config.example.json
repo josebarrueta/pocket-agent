@@ -1,0 +1,36 @@
+{
+  "signal": {
+    "daemonUrl": "http://127.0.0.1:8080",
+    "account": "+15551234567",
+    "allowedSenders": ["+15557654321"]
+  },
+  "repositories": {
+    "pocket-agent": "/Users/you/code/pocket-agent",
+    "website": "/Users/you/code/website"
+  },
+  "stateDir": "~/.local/share/pocket-agent",
+  "agent": {
+    "model": "anthropic/claude-sonnet-4-5",
+    "thinking": "medium",
+    "permissions": {
+      "read": "allow",
+      "write": "ask",
+      "bash": "ask"
+    }
+  },
+  "mcpServers": {
+    "example-readonly": {
+      "command": "/usr/local/bin/docker",
+      "args": [
+        "run", "--rm", "-i", "--network=none", "--read-only",
+        "example/mcp-server@sha256:PIN_THE_IMAGE_DIGEST"
+      ],
+      "env": {},
+      "defaultToolDecision": "deny",
+      "tools": {
+        "search": "ask"
+      },
+      "timeoutMs": 30000
+    }
+  }
+}
