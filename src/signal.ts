@@ -1,4 +1,4 @@
-import WebSocket, { type RawData } from "ws";
+import { randomUUID } from "node:crypto";
 import type { IncomingMessage, Messenger } from "./types.js";
 
 interface SignalEnvelope {
@@ -14,9 +14,7 @@ interface SignalEnvelope {
   syncMessage?: unknown;
 }
 
-interface SignalEvent {
-  account?: string;
-  envelope?: SignalEnvelope;
+interface SignalNotification {
   method?: string;
   params?: {
     account?: string;
@@ -26,12 +24,9 @@ interface SignalEvent {
 }
 
 export class SignalMessenger implements Messenger {
+  private readonly abortController = new AbortController();
   private readonly allowed: Set<string>;
-  private socket: WebSocket | undefined;
-  private reconnectTimer: NodeJS.Timeout | undefined;
-  private stopped = false;
-  private onMessage?: (message: IncomingMessage) => Promise<void>;
-  private messageQueue: Promise<void> = Promise.resolve();
+  private loop?: Promise<void>;
 
   constructor(
     private readonly baseUrl: string,
@@ -42,96 +37,89 @@ export class SignalMessenger implements Messenger {
   }
 
   async start(onMessage: (message: IncomingMessage) => Promise<void>): Promise<void> {
-    if (this.onMessage) throw new Error("Signal messenger is already started");
-    this.onMessage = onMessage;
+    if (this.loop) throw new Error("Signal messenger is already started");
     await this.waitUntilReachable();
-    await this.connect();
+    this.loop = this.receiveLoop(onMessage);
   }
 
   async send(conversationId: string, text: string): Promise<void> {
-    const response = await fetch(new URL("/v2/send", this.baseUrl), {
+    const response = await fetch(new URL("/api/v1/rpc", this.baseUrl), {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
-        number: this.account,
-        recipients: [conversationId],
-        message: text,
+        jsonrpc: "2.0",
+        id: randomUUID(),
+        method: "send",
+        params: { account: this.account, recipient: [conversationId], message: text },
       }),
       signal: AbortSignal.timeout(15_000),
     });
-    if (!response.ok) {
-      const detail = await response.text();
-      throw new Error(`Signal send failed: HTTP ${response.status} ${detail.slice(0, 500)}`);
-    }
+    if (!response.ok) throw new Error(`Signal send failed: HTTP ${response.status}`);
+    const result = await response.json() as { error?: { message?: string } };
+    if (result.error) throw new Error(`Signal send failed: ${result.error.message ?? "JSON-RPC error"}`);
   }
 
   async close(): Promise<void> {
-    this.stopped = true;
-    if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
-    if (this.socket) {
-      await new Promise<void>((resolve) => {
-        const socket = this.socket!;
-        socket.once("close", () => resolve());
-        socket.close();
-        setTimeout(() => { socket.terminate(); resolve(); }, 1_000).unref();
-      });
-    }
-    await this.messageQueue;
+    this.abortController.abort();
+    await this.loop?.catch((error: unknown) => {
+      if (!this.abortController.signal.aborted) throw error;
+    });
   }
 
   private async waitUntilReachable(): Promise<void> {
-    const response = await fetch(new URL("/v1/health", this.baseUrl), {
+    const response = await fetch(new URL("/api/v1/check", this.baseUrl), {
       signal: AbortSignal.timeout(5_000),
     });
-    if (!response.ok) throw new Error(`signal-cli REST API is not ready: HTTP ${response.status}`);
+    if (!response.ok) throw new Error(`signal-cli daemon is not ready: HTTP ${response.status}`);
   }
 
-  private async connect(): Promise<void> {
-    const endpoint = new URL(`/v1/receive/${encodeURIComponent(this.account)}`, this.baseUrl);
-    endpoint.protocol = endpoint.protocol === "https:" ? "wss:" : "ws:";
+  private async receiveLoop(onMessage: (message: IncomingMessage) => Promise<void>): Promise<void> {
+    while (!this.abortController.signal.aborted) {
+      try {
+        await this.consumeEvents(onMessage);
+      } catch (error) {
+        if (this.abortController.signal.aborted) return;
+        console.error("Signal event stream disconnected:", error);
+        await new Promise((resolve) => setTimeout(resolve, 2_000));
+      }
+    }
+  }
 
-    await new Promise<void>((resolve, reject) => {
-      const socket = new WebSocket(endpoint);
-      this.socket = socket;
-      const initialError = (error: Error) => reject(error);
-      socket.once("error", initialError);
-      socket.once("open", () => {
-        socket.off("error", initialError);
-        resolve();
-      });
-      socket.on("message", (data) => this.enqueueMessage(data));
-      socket.on("error", (error) => console.error("Signal WebSocket error:", error.message));
-      socket.once("close", () => {
-        if (this.socket === socket) this.socket = undefined;
-        if (!this.stopped) this.scheduleReconnect();
-      });
+  private async consumeEvents(onMessage: (message: IncomingMessage) => Promise<void>): Promise<void> {
+    const response = await fetch(new URL("/api/v1/events", this.baseUrl), {
+      headers: { accept: "text/event-stream" },
+      signal: this.abortController.signal,
     });
+    if (!response.ok || !response.body) {
+      throw new Error(`Signal events failed: HTTP ${response.status}`);
+    }
+
+    const reader = response.body.pipeThrough(new TextDecoderStream()).getReader();
+    let buffer = "";
+    while (!this.abortController.signal.aborted) {
+      const { value, done } = await reader.read();
+      if (done) throw new Error("event stream ended");
+      buffer += value;
+      const events = buffer.split(/\r?\n\r?\n/);
+      buffer = events.pop() ?? "";
+      for (const event of events) {
+        const data = event.split(/\r?\n/)
+          .filter((line) => line.startsWith("data:"))
+          .map((line) => line.slice(5).trimStart())
+          .join("\n");
+        if (!data) continue;
+        await this.handleNotification(JSON.parse(data) as SignalNotification, onMessage);
+      }
+    }
   }
 
-  private scheduleReconnect(): void {
-    if (this.reconnectTimer || this.stopped) return;
-    this.reconnectTimer = setTimeout(() => {
-      this.reconnectTimer = undefined;
-      void this.connect().catch((error: unknown) => {
-        console.error("Signal WebSocket reconnect failed:", error);
-        this.scheduleReconnect();
-      });
-    }, 2_000);
-  }
-
-  private enqueueMessage(data: RawData): void {
-    this.messageQueue = this.messageQueue
-      .then(async () => {
-        const event = JSON.parse(data.toString()) as SignalEvent;
-        await this.handleEvent(event);
-      })
-      .catch((error: unknown) => console.error("Invalid Signal event:", error));
-  }
-
-  private async handleEvent(event: SignalEvent): Promise<void> {
-    if (event.method && event.method !== "receive") return;
-    const envelope = event.envelope ?? event.params?.envelope ?? event.params?.result?.envelope;
-    const account = event.account ?? event.params?.account ?? event.params?.result?.account;
+  private async handleNotification(
+    notification: SignalNotification,
+    onMessage: (message: IncomingMessage) => Promise<void>,
+  ): Promise<void> {
+    if (notification.method !== "receive") return;
+    const envelope = notification.params?.envelope ?? notification.params?.result?.envelope;
+    const account = notification.params?.account ?? notification.params?.result?.account;
     if (!envelope || (account && account !== this.account) || envelope.syncMessage) return;
     if (envelope.dataMessage?.groupInfo) return; // MVP intentionally accepts private chats only.
 
@@ -140,9 +128,9 @@ export class SignalMessenger implements Messenger {
     );
     const sender = candidates.find((candidate) => this.allowed.has(candidate));
     const text = envelope.dataMessage?.message?.trim();
-    if (!sender || !text || !this.onMessage) return;
+    if (!sender || !text) return;
 
-    await this.onMessage({
+    await onMessage({
       id: `${envelope.dataMessage?.timestamp ?? envelope.timestamp ?? Date.now()}`,
       conversationId: sender,
       senderId: sender,

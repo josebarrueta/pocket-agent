@@ -1,0 +1,9 @@
+.git
+.gitignore
+node_modules
+dist
+config.json
+.env
+signal-cli-data
+*.log
+.DS_Store

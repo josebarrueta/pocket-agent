@@ -17,6 +17,14 @@ Approvals are not isolation. An allowed shell command can evade later checks, an
 
 Use a dedicated OS account or container/VM, mount only required repositories, keep secrets out of the environment, restrict egress, enable backups, and review every approval. Pin dependencies and MCP container image digests. Never publish the Signal daemon port; the supplied compose file binds it to loopback.
 
+## Signal image provenance
+
+The daemon image is built locally from the repository Dockerfile. Its final `scratch` stage contains the checksum-verified upstream `signal-cli` native executable, its required runtime libraries, and CA certificates—no shell, package manager, Java runtime, curl, or REST wrapper. Review changes to the Dockerfile, pinned version, archive digest, or base-image digest as security-sensitive supply-chain changes.
+
+The separate `link-helper` image includes Debian, a shell, and `qrencode` for one-time setup. It is not the daemon image and should not remain running. Both images still trust the upstream `signal-cli` release artifact, Debian build-stage packages, Docker/build tooling, and the host kernel/VM. A locally authored image narrows and makes the contents auditable; it does not make upstream code inherently trusted.
+
+The daemon requires outbound network access to Signal and persistent write access to `signal-cli-data`. All other filesystem content is read-only, capabilities are dropped, and inbound access is loopback-only. Do not loosen these controls without reviewing the consequence.
+
 ## Secrets and logs
 
 Protect `config.json`, Pi's credential directory, `signal-cli-data`, and the configured state directory with owner-only permissions. Tool arguments may be sent to Signal for approval and may contain sensitive data. The application does not intentionally log message bodies, but upstream processes may log diagnostics.

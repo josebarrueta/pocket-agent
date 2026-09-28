@@ -50,23 +50,49 @@ The deep seams are intentionally small:
 - Docker (recommended for `signal-cli` and MCP isolation)
 - A Signal account. Linking `signal-cli` as a secondary device is recommended.
 
+## The Signal image
+
+The repository builds its own image from [`docker/signal-cli/Dockerfile`](docker/signal-cli/Dockerfile). It does **not** download or run `signal-cli-rest-api`.
+
+The long-running image contains only:
+
+- the upstream `signal-cli` native executable;
+- its required glibc, libgcc, and zlib runtime files;
+- CA certificates needed to reach Signal.
+
+The final image is `FROM scratch`: it has no shell, package manager, curl, Java runtime, or wrapper web application. The upstream `signal-cli` archive is pinned to version `0.13.20` and verified during the build against its published SHA-256 digest. The Debian build-stage image is also digest-pinned.
+
+A separate one-off `link-helper` build target contains `qrencode` and a shell solely to display the device-link QR code. It is not used by the long-running daemon.
+
 ## Setup
 
 ```bash
 npm install
 cp config.example.json config.json
-cp docker-compose.signal.yml docker-compose.yml
 mkdir -p signal-cli-data
-docker compose up -d
+chmod 700 signal-cli-data
+
+# Build only from this repository's reviewed Dockerfile.
+docker compose build --pull
+
+# One-time device linking. Scan the displayed QR in Signal under:
+# Settings → Linked devices → +
+docker compose --profile setup run --rm signal-link
+
+# Start the minimal daemon after linking completes.
+docker compose up -d signal-cli
+curl --fail http://127.0.0.1:8080/api/v1/check
 ```
 
-Link Signal before using `json-rpc` mode. The easiest route is to temporarily set `MODE: normal`, restart, open:
+On Linux, the container runs as UID/GID `65532`. If the link command reports a permission error, set ownership before retrying:
 
-```text
-http://127.0.0.1:8080/v1/qrcodelink?device_name=pocket-agent
+```bash
+sudo chown -R 65532:65532 signal-cli-data
 ```
 
-Scan it in Signal under **Settings → Linked devices**, then restore `MODE: json-rpc` and restart the container. Keep `signal-cli-data` private; it contains account cryptographic material.
+On Apple Silicon, Compose runs the upstream x86-64 native release under Docker's `linux/amd64` emulation. This is slower at startup but avoids adding a Java runtime or maintaining an unverified custom native build.
+
+Keep `signal-cli-data` private and backed up securely; it contains linked-device cryptographic material. Do not run `signal-link` while the daemon is running because both processes would contend for the same account database.
 
 Edit `config.json`:
 
@@ -97,6 +123,20 @@ Bot: ❓ [1] Allow Pi tool bash?
 You: /answer 1 yes
 Bot: ✅ [ab12cd34]
      Reproduced the race, fixed ..., and all checkout tests pass.
+```
+
+## Signal container controls
+
+The daemon runs as numeric user `65532`, with a read-only root filesystem, all Linux capabilities dropped, `no-new-privileges`, and bounded CPU/memory/PIDs. Its sole persistent writable mount is `signal-cli-data`. Port 8080 is published on loopback only. A size-capped ephemeral `/tmp` is executable because the native image must extract and load its bundled `libsignal`; it remains `nosuid,nodev` and disappears with the container.
+
+The container necessarily has outbound network access to communicate with Signal. Pocket Agent talks directly to `signal-cli`'s HTTP JSON-RPC and SSE endpoints; there is no third-party REST wrapper in between. Container isolation reduces attack surface but is not a perfect security boundary, especially under Docker Desktop's VM and x86 emulation.
+
+To inspect exactly what will run:
+
+```bash
+docker compose build signal-cli
+docker image history --no-trunc pocket-agent/signal-cli:0.13.20
+docker inspect pocket-agent/signal-cli:0.13.20
 ```
 
 ## MCP safety model
