@@ -6,6 +6,7 @@ import { loadConfig } from "./config.js";
 import { Controller } from "./controller.js";
 import { DockerSandboxRunner } from "./docker-sandbox.js";
 import { SignalMessenger } from "./signal.js";
+import { createWorkspaceCapabilityTools, WORKSPACE_CAPABILITY_NAMES } from "./workspace-capabilities.js";
 import { DisposableWorkspaceManager } from "./workspace.js";
 
 async function main(): Promise<void> {
@@ -17,11 +18,14 @@ async function main(): Promise<void> {
     config.signal.allowedSenders,
   );
   const approvals = new MessageApprovalBroker(messenger);
+  const workspaces = new DisposableWorkspaceManager(join(config.stateDir, "workspaces"), config.repositories);
+  await workspaces.reclaimStale(new Date());
   const capabilityBroker = new CapabilityBroker({
     socketPath: join(config.stateDir, "broker", "mcp.sock"),
     auditPath: join(config.stateDir, "audit", "capabilities.ndjson"),
-    tools: [],
+    tools: createWorkspaceCapabilityTools(workspaces),
     approvals,
+    defaultMaxOutputBytes: 6 * 1024 * 1024,
   });
   await capabilityBroker.start();
   try {
@@ -32,7 +36,7 @@ async function main(): Promise<void> {
       thinking: config.agent.thinking,
       permissions: config.agent.permissions,
       capabilityLeases: capabilityBroker,
-      allowedCapabilities: [],
+      allowedCapabilities: WORKSPACE_CAPABILITY_NAMES,
       limits: {
         cpus: config.sandbox.cpus,
         memoryBytes: config.sandbox.memoryBytes,
@@ -42,8 +46,6 @@ async function main(): Promise<void> {
       },
     });
     await sandboxes.reconcile();
-    const workspaces = new DisposableWorkspaceManager(join(config.stateDir, "workspaces"), config.repositories);
-    await workspaces.reclaimStale(new Date());
     const controller = new Controller(messenger, approvals, sandboxes, workspaces);
 
     let shuttingDown = false;

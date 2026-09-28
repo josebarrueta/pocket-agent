@@ -1,4 +1,5 @@
 import { constants } from "node:fs";
+import { createHash } from "node:crypto";
 import {
   chmod,
   lstat,
@@ -12,7 +13,7 @@ import {
 } from "node:fs/promises";
 import { dirname, isAbsolute, join, normalize, resolve, sep } from "node:path";
 import { promisify } from "node:util";
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 
 const execFileAsync = promisify(execFile);
 const METADATA_FILE = "workspace.json";
@@ -46,11 +47,34 @@ export interface WorkspaceProvider {
   create(jobId: string, repositoryAlias: string): Promise<JobWorkspace>;
 }
 
+export interface WorkspacePatchStatus {
+  state: "none" | "submitted" | "applied";
+  patchId?: string;
+  files: readonly WorkspacePatchFile[];
+  bytes: number;
+  patch?: string;
+  appliedAt?: string;
+}
+
+export interface WorkspaceCapabilityTarget {
+  readonly jobId: string;
+  readonly repositoryAlias: string;
+  readMetadata(): Promise<{ jobId: string; repositoryAlias: string; patchLimits: PatchLimits }>;
+  submitPatch(patch: string): Promise<WorkspacePatchStatus>;
+  getPatchStatus(): Promise<WorkspacePatchStatus>;
+  applyPatch(patchId: string): Promise<WorkspacePatchStatus>;
+}
+
+export interface WorkspaceCapabilityRegistry {
+  resolve(jobId: string, repositoryAlias: string): WorkspaceCapabilityTarget | undefined;
+}
+
 export interface WorkspaceManagerOptions {
   maxSnapshotFiles?: number;
   maxSnapshotBytes?: number;
   maxFileBytes?: number;
   patchLimits?: Partial<PatchLimits>;
+  allowBinaryPatches?: boolean;
 }
 
 interface WorkspaceMetadata {
@@ -83,11 +107,13 @@ const DEFAULT_PATCH_LIMITS: PatchLimits = {
   maxFiles: 200,
 };
 
-export class DisposableWorkspaceManager implements WorkspaceProvider {
+export class DisposableWorkspaceManager implements WorkspaceProvider, WorkspaceCapabilityRegistry {
   readonly aliases: readonly string[];
   private readonly root: string;
   private readonly scanLimits: ScanLimits;
   private readonly patchLimits: PatchLimits;
+  private readonly allowBinaryPatches: boolean;
+  private readonly active = new Map<string, DisposableJobWorkspace>();
 
   constructor(
     root: string,
@@ -105,6 +131,7 @@ export class DisposableWorkspaceManager implements WorkspaceProvider {
       maxBytes: options.patchLimits?.maxBytes ?? DEFAULT_PATCH_LIMITS.maxBytes,
       maxFiles: options.patchLimits?.maxFiles ?? DEFAULT_PATCH_LIMITS.maxFiles,
     };
+    this.allowBinaryPatches = options.allowBinaryPatches ?? false;
     assertPositiveLimits(this.scanLimits);
     assertPositiveLimits(this.patchLimits);
   }
@@ -137,18 +164,29 @@ export class DisposableWorkspaceManager implements WorkspaceProvider {
       await copyFiles(source, controlPath, files, this.scanLimits.maxFileBytes);
       await copyFiles(controlPath, workspacePath, files, this.scanLimits.maxFileBytes);
       await initializeBaseline(controlPath);
-      return new DisposableJobWorkspace(
+      const workspace = new DisposableJobWorkspace(
         jobId,
+        repositoryAlias,
+        source,
         jobRoot,
         controlPath,
         workspacePath,
         this.scanLimits,
         this.patchLimits,
+        this.allowBinaryPatches,
+        () => this.active.delete(jobId),
       );
+      this.active.set(jobId, workspace);
+      return workspace;
     } catch (error) {
       await rm(jobRoot, { recursive: true, force: true });
       throw error;
     }
+  }
+
+  resolve(jobId: string, repositoryAlias: string): WorkspaceCapabilityTarget | undefined {
+    const workspace = this.active.get(jobId);
+    return workspace?.repositoryAlias === repositoryAlias ? workspace : undefined;
   }
 
   /** Removes recognized job directories whose trusted metadata is old enough. */
@@ -189,17 +227,22 @@ export class DisposableWorkspaceManager implements WorkspaceProvider {
   }
 }
 
-class DisposableJobWorkspace implements JobWorkspace {
+class DisposableJobWorkspace implements JobWorkspace, WorkspaceCapabilityTarget {
   private disposed = false;
   private operation = Promise.resolve();
+  private candidate?: { patchId: string; patch: string; files: readonly WorkspacePatchFile[]; bytes: number; appliedAt?: string };
 
   constructor(
     readonly jobId: string,
+    readonly repositoryAlias: string,
+    private readonly sourcePath: string,
     private readonly jobRoot: string,
     private readonly controlPath: string,
     readonly path: string,
     private readonly scanLimits: ScanLimits,
     private readonly defaultPatchLimits: PatchLimits,
+    private readonly allowBinaryPatches: boolean,
+    private readonly onDispose: () => void,
   ) {}
 
   exportPatch(overrides: Partial<PatchLimits> = {}): Promise<WorkspacePatch> {
@@ -239,12 +282,88 @@ class DisposableJobWorkspace implements JobWorkspace {
     });
   }
 
+  readMetadata(): Promise<{ jobId: string; repositoryAlias: string; patchLimits: PatchLimits }> {
+    return this.exclusive(async () => {
+      this.assertActive();
+      return { jobId: this.jobId, repositoryAlias: this.repositoryAlias, patchLimits: { ...this.defaultPatchLimits } };
+    });
+  }
+
+  submitPatch(patch: string): Promise<WorkspacePatchStatus> {
+    return this.exclusive(async () => {
+      this.assertActive();
+      if (!patch || patch.includes("\0")) throw new Error("Patch must be non-empty UTF-8 text");
+      if (Buffer.byteLength(patch, "utf8") > this.defaultPatchLimits.maxBytes) {
+        throw new Error(`Patch exceeds ${this.defaultPatchLimits.maxBytes} bytes`);
+      }
+      rejectUnsafePatchDirectives(patch);
+      await resetControlToBaseline(this.controlPath);
+      await gitWithInput(this.controlPath, ["apply", "--check", "--binary", "--whitespace=nowarn", "-"], patch);
+      await gitWithInput(this.controlPath, ["apply", "--binary", "--whitespace=nowarn", "-"], patch);
+      const files = await scanTree(this.controlPath, this.scanLimits, new Set([".git"]));
+      await git(this.controlPath, ["add", "--all", "--", "."]);
+      const manifest = parseManifest(await git(this.controlPath, [
+        "diff", "--cached", "--name-status", "-z", "--no-renames", "HEAD", "--", ".",
+      ]));
+      if (manifest.length > this.defaultPatchLimits.maxFiles) {
+        throw new Error(`Patch changes ${manifest.length} files; limit is ${this.defaultPatchLimits.maxFiles}`);
+      }
+      const canonical = await boundedPatch(this.controlPath, this.defaultPatchLimits.maxBytes);
+      if (!canonical || manifest.length === 0) throw new Error("Patch makes no changes");
+      if (!this.allowBinaryPatches && canonical.includes("GIT binary patch")) throw new Error("Binary patches are not allowed");
+      const patchId = createHash("sha256").update(canonical).digest("hex");
+      this.candidate = { patchId, patch: canonical, files: manifest, bytes: Buffer.byteLength(canonical, "utf8") };
+      return this.status();
+    });
+  }
+
+  getPatchStatus(): Promise<WorkspacePatchStatus> {
+    return this.exclusive(async () => {
+      this.assertActive();
+      return this.status(true);
+    });
+  }
+
+  applyPatch(patchId: string): Promise<WorkspacePatchStatus> {
+    return this.exclusive(async () => {
+      this.assertActive();
+      const candidate = this.candidate;
+      if (!candidate || candidate.patchId !== patchId) throw new Error("Unknown or stale patch ID");
+      if (candidate.appliedAt) return this.status();
+      const source = await validateRepository(this.sourcePath);
+      if (source !== this.sourcePath) throw new Error("Configured repository identity changed");
+      await listRepositoryFiles(source, this.scanLimits);
+      await assertSafeTargetPaths(source, candidate.files);
+      await gitWithInput(source, ["apply", "--check", "--binary", "--whitespace=nowarn", "-"], candidate.patch);
+      await gitWithInput(source, ["apply", "--binary", "--whitespace=nowarn", "-"], candidate.patch);
+      candidate.appliedAt = new Date().toISOString();
+      return this.status();
+    });
+  }
+
   dispose(): Promise<void> {
     return this.exclusive(async () => {
       if (this.disposed) return;
       this.disposed = true;
+      this.onDispose();
       await rm(this.jobRoot, { recursive: true, force: true });
     });
+  }
+
+  private status(includePatch = false): WorkspacePatchStatus {
+    if (!this.candidate) return { state: "none", files: [], bytes: 0 };
+    return {
+      state: this.candidate.appliedAt ? "applied" : "submitted",
+      patchId: this.candidate.patchId,
+      files: this.candidate.files,
+      bytes: this.candidate.bytes,
+      ...(includePatch ? { patch: this.candidate.patch } : {}),
+      ...(this.candidate.appliedAt ? { appliedAt: this.candidate.appliedAt } : {}),
+    };
+  }
+
+  private assertActive(): void {
+    if (this.disposed) throw new Error("Workspace is disposed");
   }
 
   private async exclusive<T>(operation: () => Promise<T>): Promise<T> {
@@ -304,12 +423,13 @@ async function listRepositoryFiles(source: string, limits: ScanLimits): Promise<
   return files;
 }
 
-async function scanTree(root: string, limits: ScanLimits): Promise<ScannedFile[]> {
+async function scanTree(root: string, limits: ScanLimits, excludedTopLevel = new Set<string>()): Promise<ScannedFile[]> {
   const files: ScannedFile[] = [];
   let bytes = 0;
   const visit = async (directory: string, prefix: string): Promise<void> => {
     const entries = (await readdir(directory, { withFileTypes: true })).sort((a, b) => a.name.localeCompare(b.name));
     for (const entry of entries) {
+      if (!prefix && excludedTopLevel.has(entry.name)) continue;
       const path = prefix ? `${prefix}/${entry.name}` : entry.name;
       validateRelativePath(path);
       if (entry.name === ".git" || entry.name === ".gitmodules") throw new Error(`Workspace metadata path is not allowed: ${path}`);
@@ -330,6 +450,25 @@ async function scanTree(root: string, limits: ScanLimits): Promise<ScannedFile[]
   };
   await visit(root, "");
   return files;
+}
+
+async function assertSafeTargetPaths(root: string, files: readonly WorkspacePatchFile[]): Promise<void> {
+  for (const file of files) {
+    const parts = file.path.split("/");
+    for (let index = 1; index <= parts.length; index++) {
+      const path = containedPath(root, parts.slice(0, index).join("/"));
+      let info;
+      try { info = await lstat(path); } catch (error) {
+        if (isMissing(error)) break;
+        throw error;
+      }
+      if (info.isSymbolicLink()) throw new Error(`Symbolic links are not allowed in patch targets: ${file.path}`);
+      if (index < parts.length && !info.isDirectory()) throw new Error(`Patch target parent is not a directory: ${file.path}`);
+      if (index === parts.length && !info.isDirectory() && (!info.isFile() || info.nlink !== 1)) {
+        throw new Error(`Patch target is not a regular file: ${file.path}`);
+      }
+    }
+  }
 }
 
 async function copyFiles(source: string, destination: string, files: readonly ScannedFile[], maxFileBytes: number): Promise<void> {
@@ -358,9 +497,13 @@ async function initializeBaseline(controlPath: string): Promise<void> {
   ]);
 }
 
-async function resetControlTree(controlPath: string): Promise<void> {
+async function resetControlToBaseline(controlPath: string): Promise<void> {
   await git(controlPath, ["reset", "--hard", "--quiet", "HEAD"]);
   await git(controlPath, ["clean", "-ffdqx"]);
+}
+
+async function resetControlTree(controlPath: string): Promise<void> {
+  await resetControlToBaseline(controlPath);
   for (const entry of await readdir(controlPath, { withFileTypes: true })) {
     if (entry.name === ".git") continue;
     await rm(join(controlPath, entry.name), { recursive: true, force: true });
@@ -382,6 +525,66 @@ function parseManifest(output: string): WorkspacePatchFile[] {
   return files;
 }
 
+async function boundedPatch(cwd: string, maxBytes: number): Promise<string> {
+  let patch: string;
+  try {
+    patch = await git(cwd, [
+      "diff", "--cached", "--binary", "--full-index", "--no-ext-diff", "--no-textconv", "--no-renames", "HEAD", "--", ".",
+    ], maxBytes + 1);
+  } catch (error) {
+    if (isMaxBuffer(error)) throw new Error(`Patch exceeds ${maxBytes} bytes`);
+    throw error;
+  }
+  if (Buffer.byteLength(patch, "utf8") > maxBytes) throw new Error(`Patch exceeds ${maxBytes} bytes`);
+  return patch;
+}
+
+function rejectUnsafePatchDirectives(patch: string): void {
+  if (/^(rename|copy) (from|to) /m.test(patch) || /^similarity index /m.test(patch)) {
+    throw new Error("Patch renames and copies are not supported");
+  }
+  if (/^(new file mode|old mode|new mode) 160000$/m.test(patch)) {
+    throw new Error("Patch submodules are not supported");
+  }
+}
+
+async function gitWithInput(cwd: string, args: readonly string[], input: string): Promise<string> {
+  const hardenedArgs = [
+    "-c", "core.fsmonitor=false",
+    "-c", "core.hooksPath=/dev/null",
+    "-c", "credential.helper=",
+    ...args,
+  ];
+  return new Promise<string>((resolveGit, rejectGit) => {
+    const child = spawn("git", hardenedArgs, {
+      cwd,
+      env: gitEnvironment(),
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    const stdout: Buffer[] = [];
+    const stderr: Buffer[] = [];
+    let bytes = 0;
+    const collect = (destination: Buffer[]) => (chunk: Buffer) => {
+      bytes += chunk.length;
+      if (bytes > 16 * 1024 * 1024) {
+        child.kill("SIGKILL");
+        return;
+      }
+      destination.push(chunk);
+    };
+    child.stdout.on("data", collect(stdout));
+    child.stderr.on("data", collect(stderr));
+    child.stdin.on("error", () => { /* process exit reports the failure */ });
+    child.once("error", rejectGit);
+    child.once("close", (code) => {
+      if (bytes > 16 * 1024 * 1024) return rejectGit(new Error("Git output exceeded its limit"));
+      if (code !== 0) return rejectGit(new Error(Buffer.concat(stderr).toString("utf8").trim() || `Git exited ${code}`));
+      resolveGit(Buffer.concat(stdout).toString("utf8"));
+    });
+    child.stdin.end(input, "utf8");
+  });
+}
+
 async function git(cwd: string, args: readonly string[], maxBuffer = 16 * 1024 * 1024): Promise<string> {
   const hardenedArgs = [
     "-c", "core.fsmonitor=false",
@@ -393,17 +596,21 @@ async function git(cwd: string, args: readonly string[], maxBuffer = 16 * 1024 *
     cwd,
     encoding: "utf8",
     maxBuffer,
-    env: {
-      PATH: process.env.PATH,
-      HOME: "/nonexistent",
-      GIT_CONFIG_NOSYSTEM: "1",
-      GIT_CONFIG_GLOBAL: "/dev/null",
-      GIT_ATTR_NOSYSTEM: "1",
-      GIT_TERMINAL_PROMPT: "0",
-      GIT_OPTIONAL_LOCKS: "0",
-    },
+    env: gitEnvironment(),
   });
   return stdout;
+}
+
+function gitEnvironment(): NodeJS.ProcessEnv {
+  return {
+    PATH: process.env.PATH,
+    HOME: "/nonexistent",
+    GIT_CONFIG_NOSYSTEM: "1",
+    GIT_CONFIG_GLOBAL: "/dev/null",
+    GIT_ATTR_NOSYSTEM: "1",
+    GIT_TERMINAL_PROMPT: "0",
+    GIT_OPTIONAL_LOCKS: "0",
+  };
 }
 
 function validateJobId(jobId: string): void {

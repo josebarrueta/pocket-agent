@@ -157,7 +157,7 @@ MCP is the mediation protocol, not the isolation mechanism. The sandbox provides
 
 Pi, its built-in read/write/bash tools, and its in-memory session now run only inside the Docker worker. The host package no longer installs Pi or exposes a host-side agent/MCP adapter. Workers receive only a disposable workspace, safe model-selection metadata, and normalized approval responses; they receive no host environment or credentials.
 
-The host now exposes an authenticated, job-scoped MCP broker over a private Unix socket mounted read-only into native Linux workers. No production capabilities are registered yet; issue #7 adds workspace tools. The credential-free model proxy is also pending, so production workers still cannot reach model providers. Docker Desktop for macOS cannot forward the host Unix socket and fails capability access closed. Approvals reduce accidental tool use inside the disposable workspace; sandbox isolation—not approval—is the security seam.
+The host exposes an authenticated, job-scoped MCP broker over a private Unix socket mounted read-only into native Linux workers. The worker registers its scoped tools with Pi, and the broker currently exposes only metadata, patch submission/status, and separately approved patch application. The credential-free model proxy is still pending, so production workers cannot reach model providers. Docker Desktop for macOS cannot forward the host Unix socket and fails capability access closed. Approvals reduce accidental tool use inside the disposable workspace; sandbox isolation—not approval—is the security seam.
 
 ## Recommended migration order
 

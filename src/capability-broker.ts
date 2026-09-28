@@ -4,7 +4,7 @@ import { appendFile, chmod, mkdir, rm } from "node:fs/promises";
 import { dirname } from "node:path";
 import type { ApprovalPort } from "./types.js";
 
-const MAX_REQUEST_BYTES = 1024 * 1024;
+const MAX_REQUEST_BYTES = 8 * 1024 * 1024;
 const MCP_PROTOCOL_VERSION = "2025-06-18";
 const FORBIDDEN_TOOLS = new Set(["exec", "shell", "command", "host.exec", "host.shell"]);
 

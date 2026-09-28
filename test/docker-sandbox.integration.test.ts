@@ -164,6 +164,25 @@ integration("job worker reaches only its authenticated capability scope over pri
   assert.deepEqual(response.result.tools.map((tool: { name: string }) => tool.name), ["workspace.read_metadata"]);
   await job.dispose();
   await assert.rejects(broker.list(issuedCredential, job.id), /revoked/);
+
+  const realRunner = new DockerSandboxRunner({
+    dockerPath,
+    image: image!,
+    allowUnpinnedImageForTests: true,
+    capabilityLeases: leases,
+    allowedCapabilities: ["workspace.read_metadata"],
+  });
+  const realWorker = await realRunner.create({
+    id: `broker-real-${process.pid}`,
+    workspacePath: workspace,
+    conversationId: "test",
+    repositoryScope: "repo",
+    deadlineAt: new Date(Date.now() + 30_000),
+    outputLimitBytes: 64 * 1024,
+    events: { status: async () => {} },
+  });
+  await assert.rejects(realWorker.start("initialize capabilities"), /No model is available inside the worker/);
+  await realWorker.dispose();
 });
 
 integration("sandboxed test tool cannot read host files, environment secrets, or Docker socket", async (t) => {

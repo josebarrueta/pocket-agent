@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
 import { promisify } from "node:util";
-import { DisposableWorkspaceManager } from "../src/workspace.js";
+import { DisposableWorkspaceManager, type WorkspaceCapabilityTarget } from "../src/workspace.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -27,6 +27,18 @@ async function repository(root: string, name: string): Promise<string> {
   await git(path, "add", ".");
   await git(path, "-c", "user.name=Test", "-c", "user.email=test@invalid", "commit", "--quiet", "-m", "baseline");
   return path;
+}
+
+async function candidatePatch(source: string, mutate: () => Promise<void>): Promise<string> {
+  await mutate();
+  await git(source, "add", "--all");
+  const { stdout } = await execFileAsync("git", ["diff", "--cached", "--binary", "--full-index", "HEAD"], {
+    cwd: source,
+    encoding: "utf8",
+  });
+  await git(source, "reset", "--hard", "--quiet", "HEAD");
+  await git(source, "clean", "-ffdqx");
+  return stdout;
 }
 
 async function fixture() {
@@ -113,6 +125,78 @@ test("rejects escaping links, submodules, oversized patches, and excess changed 
   await symlink(join(root, "outside"), join(workspace.path, "escape"));
   await assert.rejects(workspace.exportPatch(), /Symbolic links/);
   await workspace.dispose();
+});
+
+test("submits, reviews, and applies a validated patch only to its configured repository", async (t) => {
+  const { root, source, manager } = await fixture();
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const workspace = await manager.create("capability", "app");
+  const target = manager.resolve("capability", "app");
+  assert.ok(target);
+  assert.equal(manager.resolve("capability", "other"), undefined);
+  const patch = await candidatePatch(source, async () => {
+    await writeFile(join(source, "kept.txt"), "approved change\n");
+    await rm(join(source, "delete.txt"));
+    await writeFile(join(source, "added.txt"), "added\n");
+  });
+
+  const submitted = await target.submitPatch(patch);
+  assert.equal(submitted.state, "submitted");
+  assert.deepEqual(submitted.files, [
+    { path: "added.txt", status: "added" },
+    { path: "delete.txt", status: "deleted" },
+    { path: "kept.txt", status: "modified" },
+  ]);
+  assert.match(submitted.patchId!, /^[a-f0-9]{64}$/);
+  await assert.rejects(target.applyPatch("0".repeat(64)), /stale patch ID/);
+  const applied = await target.applyPatch(submitted.patchId!);
+  assert.equal(applied.state, "applied");
+  assert.equal(await readFile(join(source, "kept.txt"), "utf8"), "approved change\n");
+  assert.equal(await readFile(join(source, "added.txt"), "utf8"), "added\n");
+  await assert.rejects(readFile(join(source, "delete.txt")), /ENOENT/);
+  await workspace.dispose();
+  assert.equal(manager.resolve("capability", "app"), undefined);
+});
+
+test("broker patch validation rejects binary, traversal, symlink, rename, submodule, and oversized input", async (t) => {
+  const { root, source } = await fixture();
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const manager = new DisposableWorkspaceManager(join(root, "bounded-storage"), { app: source }, {
+    patchLimits: { maxBytes: 2_000, maxFiles: 5 },
+  });
+  await manager.create("adversarial", "app");
+  const target = manager.resolve("adversarial", "app") as WorkspaceCapabilityTarget;
+
+  const binary = await candidatePatch(source, async () => writeFile(join(source, "binary.bin"), Buffer.from([0, 1, 2, 255])));
+  await assert.rejects(target.submitPatch(binary), /Binary patches/);
+
+  const symlinkPatch = await candidatePatch(source, async () => symlink("../outside", join(source, "escape")));
+  await assert.rejects(target.submitPatch(symlinkPatch), /Symbolic links/);
+
+  await git(source, "mv", "kept.txt", "renamed.txt");
+  await git(source, "add", "--all");
+  const renamePatch = await git(source, "diff", "--cached", "--find-renames", "HEAD");
+  await git(source, "reset", "--hard", "--quiet", "HEAD");
+  await assert.rejects(target.submitPatch(renamePatch), /renames/);
+
+  const traversal = "diff --git a/../../outside b/../../outside\n--- a/../../outside\n+++ b/../../outside\n@@ -0,0 +1 @@\n+escape\n";
+  await assert.rejects(target.submitPatch(traversal), /invalid path|does not exist|outside/i);
+  const absolute = "diff --git a//tmp/outside b//tmp/outside\n--- /dev/null\n+++ b//tmp/outside\n@@ -0,0 +1 @@\n+escape\n";
+  await assert.rejects(target.submitPatch(absolute), /invalid path|does not exist|outside|No such file/i);
+
+  const submodule = "diff --git a/vendor b/vendor\nnew file mode 160000\nindex 0000000..1111111\n--- /dev/null\n+++ b/vendor\n@@ -0,0 +1 @@\n+Subproject commit 1111111111111111111111111111111111111111\n";
+  await assert.rejects(target.submitPatch(submodule), /submodule|does not exist|patch/i);
+  await assert.rejects(target.submitPatch("x".repeat(2_001)), /exceeds 2000 bytes/);
+  const tooMany = await candidatePatch(source, async () => {
+    await Promise.all(Array.from({ length: 6 }, (_, index) => writeFile(join(source, `many-${index}.txt`), "x\n")));
+  });
+  await assert.rejects(target.submitPatch(tooMany), /changes 6 files/);
+
+  const valid = await candidatePatch(source, async () => writeFile(join(source, "kept.txt"), "safe change\n"));
+  const submitted = await target.submitPatch(valid);
+  await rm(join(source, "kept.txt"));
+  await symlink(join(root, "outside"), join(source, "kept.txt"));
+  await assert.rejects(target.applyPatch(submitted.patchId!), /Symbolic links/);
 });
 
 test("cleanup is idempotent and stale workspaces can be reclaimed after restart", async (t) => {

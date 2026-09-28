@@ -1,11 +1,13 @@
 #!/usr/bin/env node
 import { spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { request as httpRequest } from "node:http";
 import { mkdir } from "node:fs/promises";
 import { createInterface } from "node:readline";
 
 const PROTOCOL_VERSIONS = [1];
 const MAX_MESSAGE_BYTES = 1024 * 1024 + 4096;
+const MAX_CAPABILITY_RESPONSE_BYTES = 8 * 1024 * 1024;
 const MAX_ERROR_BYTES = 8 * 1024;
 const EX_USAGE = 64;
 const WORKSPACE = "/workspace";
@@ -69,6 +71,7 @@ function smokeTest() {
 async function createSession() {
   if (process.env.POCKET_AGENT_DISABLE_MODEL === "1") throw new Error("model execution disabled for protocol test");
   await mkdir(AGENT_DIR, { recursive: true, mode: 0o700 });
+  const { Type } = await import("typebox");
   const {
     createAgentSession,
     DefaultResourceLoader,
@@ -85,6 +88,7 @@ async function createSession() {
     defaultTools: ["read", "bash", "edit", "write"],
   }, { projectTrusted: false });
   const permissions = parsePermissions();
+  const capabilityToolNames = [];
   const approvalExtension = (pi) => {
     pi.on("tool_call", async (event) => {
       const decision = decisionFor(event.toolName, permissions);
@@ -99,6 +103,34 @@ async function createSession() {
       if (answer !== "yes") return { block: true, reason: "Denied by operator" };
     });
   };
+  const capabilityExtension = async (pi) => {
+    if (!process.env.POCKET_AGENT_MCP_SOCKET || !process.env.POCKET_AGENT_MCP_CREDENTIAL || !process.env.POCKET_AGENT_JOB_ID) return;
+    const listed = await capabilityRpc("tools/list", {});
+    for (const tool of listed.tools ?? []) {
+      const localName = String(tool.name).replace(/[^A-Za-z0-9_-]/g, "_");
+      if (capabilityToolNames.includes(localName)) throw new Error(`Capability tool name collision: ${localName}`);
+      capabilityToolNames.push(localName);
+      pi.registerTool({
+        name: localName,
+        label: String(tool.name),
+        description: String(tool.description),
+        promptSnippet: `Use ${localName} for the scoped ${tool.name} capability.`,
+        parameters: Type.Unsafe(tool.inputSchema),
+        async execute(_toolCallId, params, signal) {
+          const result = await capabilityRpc("tools/call", {
+            name: tool.name,
+            arguments: params,
+            _meta: {
+              "pocket-agent/job-id": process.env.POCKET_AGENT_JOB_ID,
+              "pocket-agent/request-id": randomUUID(),
+            },
+          }, signal);
+          const text = result.content?.find((item) => item.type === "text")?.text ?? JSON.stringify(result.structuredContent ?? null);
+          return { content: [{ type: "text", text }], details: result.structuredContent };
+        },
+      });
+    }
+  };
   const resourceLoader = new DefaultResourceLoader({
     cwd: WORKSPACE,
     agentDir: AGENT_DIR,
@@ -107,9 +139,11 @@ async function createSession() {
     noSkills: true,
     noPromptTemplates: true,
     noThemes: true,
-    extensionFactories: [approvalExtension],
+    extensionFactories: [approvalExtension, capabilityExtension],
   });
   await resourceLoader.reload();
+  const extensionErrors = resourceLoader.getExtensions().errors;
+  if (extensionErrors.length) throw new Error(`Worker extension initialization failed: ${extensionErrors[0].error}`);
 
   const modelRuntime = await ModelRuntime.create({
     authPath: `${AGENT_DIR}/auth.json`,
@@ -136,7 +170,7 @@ async function createSession() {
     resourceLoader,
     settingsManager,
     sessionManager: SessionManager.inMemory(WORKSPACE),
-    tools: ["read", "bash", "edit", "write"],
+    tools: ["read", "bash", "edit", "write", ...capabilityToolNames],
   });
   created.session.subscribe((event) => {
     if (disposed || !active || active.terminal) return;
@@ -208,6 +242,54 @@ async function cancelRun(message) {
   }
 }
 
+function capabilityRpc(method, params, signal) {
+  const body = JSON.stringify({
+    jsonrpc: "2.0",
+    id: randomUUID(),
+    method,
+    params: {
+      ...params,
+      _meta: {
+        ...(params._meta ?? {}),
+        "pocket-agent/job-id": process.env.POCKET_AGENT_JOB_ID,
+      },
+    },
+  });
+  return new Promise((resolve, reject) => {
+    const request = httpRequest({
+      socketPath: process.env.POCKET_AGENT_MCP_SOCKET,
+      path: "/mcp",
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${process.env.POCKET_AGENT_MCP_CREDENTIAL}`,
+        "content-type": "application/json",
+        "content-length": Buffer.byteLength(body),
+      },
+    }, (response) => {
+      const chunks = [];
+      let bytes = 0;
+      response.on("data", (chunk) => {
+        bytes += chunk.length;
+        if (bytes > MAX_CAPABILITY_RESPONSE_BYTES) request.destroy(new Error("Capability response exceeded its limit"));
+        else chunks.push(chunk);
+      });
+      response.on("end", () => {
+        try {
+          const rpc = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+          if (response.statusCode !== 200 || rpc.error) reject(new Error(rpc.error?.message ?? `Capability broker returned HTTP ${response.statusCode}`));
+          else resolve(rpc.result);
+        } catch (error) { reject(error); }
+      });
+    });
+    request.once("error", reject);
+    if (signal) {
+      if (signal.aborted) request.destroy(new Error("Capability call aborted"));
+      else signal.addEventListener("abort", () => request.destroy(new Error("Capability call aborted")), { once: true });
+    }
+    request.end(body);
+  });
+}
+
 function parsePermissions() {
   const fallback = { read: "allow", write: "ask", bash: "ask" };
   try {
@@ -225,6 +307,7 @@ function decisionFor(toolName, permissions) {
   if (["read", "grep", "find", "ls"].includes(toolName)) return permissions.read;
   if (["edit", "write"].includes(toolName)) return permissions.write;
   if (toolName === "bash") return permissions.bash;
+  if (toolName.startsWith("workspace_")) return "allow";
   return "deny";
 }
 

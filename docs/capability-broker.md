@@ -5,7 +5,7 @@ The trusted host runs a deny-by-default MCP capability broker. It is a deep modu
 - `CapabilityLeaseIssuer.issue(...)` creates one short-lived job lease for the sandbox adapter.
 - `CapabilityBroker.list(...)` and `call(...)` are the authenticated test surface used by the MCP transport.
 
-Capabilities are registered by trusted startup code. Workers cannot add tools or change policy. The initial broker intentionally registers no production capabilities; issue #7 adds the curated workspace tools. Generic execution names such as `host.exec` and `*.shell` are rejected at registration.
+Capabilities are registered by trusted startup code. Workers cannot add tools or change policy. The production broker registers only the curated workspace tools documented in [`workspaces.md`](workspaces.md). Generic execution names such as `host.exec` and `*.shell` are rejected at registration.
 
 ## Private transport
 
@@ -13,7 +13,7 @@ The broker listens on an owner-controlled Unix-domain socket under the state dir
 
 Host Unix-socket forwarding works with native Linux Docker and is tested in Linux CI. Docker Desktop for macOS cannot connect through a bind-mounted host Unix socket (`ENOTSUP`); capability calls are therefore not supported on that platform until a VM-local relay is implemented. The worker remains networkless and fails closed.
 
-The endpoint accepts MCP JSON-RPC at `POST /mcp` and supports `initialize`, `notifications/initialized`, `tools/list`, and `tools/call`. Requests use a bearer lease and include the bound job ID in `_meta["pocket-agent/job-id"]`; calls also include a unique `_meta["pocket-agent/request-id"]`.
+The endpoint accepts MCP JSON-RPC at `POST /mcp` and supports `initialize`, `notifications/initialized`, `tools/list`, and `tools/call`. Requests use a bearer lease and include the bound job ID in `_meta["pocket-agent/job-id"]`; calls also include a unique `_meta["pocket-agent/request-id"]`. The worker translates the scoped MCP list into Pi extension tools; host policy still governs every invocation.
 
 ## Authorization
 

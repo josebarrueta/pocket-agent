@@ -25,7 +25,20 @@ Default limits are:
 - 200 changed files per patch;
 - 2 MiB patch output.
 
-Callers may lower patch limits per export. Exceeding any limit fails closed. Patch paths are relative and validated before being returned. Applying a candidate patch to the configured checkout is deliberately not part of this module; that requires a separate capability and approval.
+Callers may lower patch limits per export. Exceeding any limit fails closed. Patch paths are relative and validated before being returned.
+
+## Broker capabilities
+
+The workspace capability adapter registers four typed tools:
+
+- `workspace.read_metadata` returns only job ID, repository alias, and patch limits;
+- `workspace.submit_patch` validates and stores a candidate without touching the configured checkout;
+- `workspace.get_patch_status` returns its bounded canonical patch, digest, manifest, size, and state for review;
+- `workspace.apply_patch` applies that exact digest after a separate one-operation approval.
+
+Scope comes from the authenticated broker lease. No tool accepts a repository path or command. Submitted patches are size-bounded, applied first to the private baseline, converted to a canonical no-renames full-index patch, and checked by the complete workspace scanner. Traversal, absolute paths, symlinks, hard links, special files, `.git` metadata, submodules, rename/copy directives, excessive files, and binary patches are rejected by default. Binary submission can be enabled only by trusted host construction options.
+
+Before approved application, the configured repository identity is revalidated, its visible files are rescanned, every target parent is checked for links and special files, and Git must pass a dry run. The patch is then applied without hooks, credentials, global configuration, or a shell. Conflicting host changes fail closed. The candidate patch body is returned only by the scoped status capability for review; it is never written to audit records or approval metadata.
 
 ## Lifecycle and recovery
 

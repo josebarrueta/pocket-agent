@@ -6,11 +6,11 @@ Pocket Agent connects a remote message to coding tools that can read files, modi
 
 - Only exact `signal.allowedSenders` are accepted.
 - Signal group messages are ignored.
-- Repository paths and MCP processes are configured locally, never through chat.
+- Repository paths and capability policy are configured locally, never through chat or worker input.
 - Jobs are scoped to the conversation that created them.
 - Pi and all built-in filesystem/shell tools execute only in a constrained disposable worker.
 - Writes and shell commands require approval by default; approvals are not the isolation seam.
-- Workers have no network access; native Linux workers receive only a short-lived authenticated MCP lease over a private Unix socket. No production capabilities are registered yet.
+- Workers have no network access; native Linux workers receive only a short-lived authenticated MCP lease over a private Unix socket. The only production capabilities are scoped workspace metadata and bounded patch submission/status/application.
 
 ## Important limitations
 
