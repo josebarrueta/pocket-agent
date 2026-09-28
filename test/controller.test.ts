@@ -4,6 +4,7 @@ import { Controller } from "../src/controller.js";
 import { InMemorySandboxRunner } from "../src/in-memory-sandbox.js";
 import type { StartMessage } from "../src/sandbox-protocol.js";
 import type { ApprovalPort, IncomingMessage, Messenger } from "../src/types.js";
+import type { JobWorkspace, WorkspacePatch, WorkspaceProvider } from "../src/workspace.js";
 
 class FakeMessenger implements Messenger {
   sent: Array<{ conversationId: string; text: string }> = [];
@@ -17,6 +18,25 @@ class FakeApprovals implements ApprovalPort {
   async request(): Promise<string> { return "yes"; }
   answer(): boolean { return this.answerResult; }
   cancelScope(): void {}
+}
+
+class FakeWorkspace implements JobWorkspace {
+  disposed = false;
+  patch: WorkspacePatch = { patch: "", files: [] };
+  constructor(readonly jobId: string, readonly path: string) {}
+  async exportPatch(): Promise<WorkspacePatch> { return this.patch; }
+  async dispose(): Promise<void> { this.disposed = true; }
+}
+
+class FakeWorkspaces implements WorkspaceProvider {
+  readonly aliases = ["app"];
+  readonly created: FakeWorkspace[] = [];
+  async create(jobId: string, alias: string): Promise<FakeWorkspace> {
+    if (alias !== "app") throw new Error(`Unknown repository alias '${alias}'`);
+    const workspace = new FakeWorkspace(jobId, `/disposable/${jobId}`);
+    this.created.push(workspace);
+    return workspace;
+  }
 }
 
 function message(text: string, conversationId = "operator"): IncomingMessage {
@@ -34,12 +54,15 @@ function firstStart(runner: InMemorySandboxRunner): StartMessage {
 test("starts a job only in an operator-configured repository", async () => {
   const messenger = new FakeMessenger();
   const runner = new InMemorySandboxRunner();
-  const controller = new Controller(messenger, new FakeApprovals(), runner, { app: "/work/app" });
+  const workspaces = new FakeWorkspaces();
+  const controller = new Controller(messenger, new FakeApprovals(), runner, workspaces);
 
   await controller.handle(message("/new app fix the login race"));
   const start = firstStart(runner);
   assert.equal(start.prompt, "fix the login race");
   assert.equal(runner.jobs[0]?.id, start.jobId);
+  assert.equal(workspaces.created[0]?.path, `/disposable/${start.jobId}`);
+  workspaces.created[0]!.patch = { patch: "diff", files: [{ path: "src/app.ts", status: "modified" }] };
 
   await runner.jobs[0]!.receive({
     protocolVersion: 1,
@@ -50,6 +73,7 @@ test("starts a job only in an operator-configured repository", async () => {
   });
   await tick();
   assert.match(messenger.sent.at(-1)?.text ?? "", /done/);
+  assert.match(messenger.sent.at(-1)?.text ?? "", /modified "src\/app.ts"/);
 
   await controller.handle(message("/new unknown do something"));
   assert.match(messenger.sent.at(-1)?.text ?? "", /Unknown repo/);
@@ -57,7 +81,7 @@ test("starts a job only in an operator-configured repository", async () => {
 
 test("bug command adds a reproduce, fix, and test instruction", async () => {
   const runner = new InMemorySandboxRunner();
-  const controller = new Controller(new FakeMessenger(), new FakeApprovals(), runner, { app: "/work/app" });
+  const controller = new Controller(new FakeMessenger(), new FakeApprovals(), runner, new FakeWorkspaces());
 
   await controller.handle(message("/bug app crashes on empty input"));
 
@@ -69,7 +93,7 @@ test("bug command adds a reproduce, fix, and test instruction", async () => {
 test("jobs cannot be selected from a different conversation", async () => {
   const messenger = new FakeMessenger();
   const runner = new InMemorySandboxRunner();
-  const controller = new Controller(messenger, new FakeApprovals(), runner, { app: "/work/app" });
+  const controller = new Controller(messenger, new FakeApprovals(), runner, new FakeWorkspaces());
 
   await controller.handle(message("/new app task", "alice"));
   const id = runner.jobs[0]!.id;
@@ -84,7 +108,8 @@ test("steers and cancels a running sandbox job", async () => {
   const messenger = new FakeMessenger();
   const approvals = new FakeApprovals();
   const runner = new InMemorySandboxRunner();
-  const controller = new Controller(messenger, approvals, runner, { app: "/work/app" });
+  const workspaces = new FakeWorkspaces();
+  const controller = new Controller(messenger, approvals, runner, workspaces);
 
   await controller.handle(message("/new app initial task"));
   await controller.handle(message("/steer focus on the parser"));
@@ -92,13 +117,15 @@ test("steers and cancels a running sandbox job", async () => {
 
   await controller.handle(message("/cancel"));
   assert.equal(runner.jobs[0]?.commands.at(-1)?.type, "cancel");
+  assert.equal(workspaces.created[0]?.disposed, true);
   assert.match(messenger.sent.at(-1)?.text ?? "", /Cancelled/);
 });
 
 test("reports a worker crash as a failed job", async () => {
   const messenger = new FakeMessenger();
   const runner = new InMemorySandboxRunner();
-  const controller = new Controller(messenger, new FakeApprovals(), runner, { app: "/work/app" });
+  const workspaces = new FakeWorkspaces();
+  const controller = new Controller(messenger, new FakeApprovals(), runner, workspaces);
 
   await controller.handle(message("/new app task"));
   const start = firstStart(runner);
@@ -114,4 +141,5 @@ test("reports a worker crash as a failed job", async () => {
   await tick();
 
   assert.match(messenger.sent.at(-1)?.text ?? "", /worker exited with code 137/);
+  assert.equal(workspaces.created[0]?.disposed, true);
 });

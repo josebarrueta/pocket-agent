@@ -114,7 +114,7 @@ Approvals should authorize one normalized operation, not a tool forever. An appr
 
 The original host checkout is not mounted into the worker. The workspace adapter creates a disposable copy or worktree for the job and imports it into a sandbox-owned volume. When work completes, it returns a patch for review or applies an explicitly approved patch through the broker.
 
-This avoids giving compromised worker code a path to unrelated repositories, host Git configuration, SSH keys, or editor credentials.
+This avoids giving compromised worker code a path to unrelated repositories, host Git configuration, SSH keys, or editor credentials. Snapshot validation, patch limits, and crash-recovery cleanup are detailed in [`workspaces.md`](workspaces.md).
 
 ### Model proxy
 

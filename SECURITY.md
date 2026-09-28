@@ -25,6 +25,10 @@ The separate `link-helper` image includes Debian, a shell, and `qrencode` for on
 
 The daemon requires outbound network access to Signal and persistent write access to `signal-cli-data`. All other filesystem content is read-only, capabilities are dropped, and inbound access is loopback-only. Do not loosen these controls without reviewing the consequence.
 
+## Workspace isolation
+
+Repository aliases resolve only from trusted startup configuration. Jobs receive a validated disposable snapshot containing tracked and non-ignored untracked regular files, never the configured checkout or its `.git` directory. Symlinks, hard links, submodules, special files, traversal, and oversized snapshots or patches are rejected. Candidate patches are not automatically applied. See [`docs/workspaces.md`](docs/workspaces.md).
+
 ## Worker image provenance
 
 The worker image uses a digest-pinned multi-platform Node base, an immutable Debian package snapshot, and a separate integrity-locked npm dependency tree. It runs as numeric UID/GID `65532`; its intended runtime has a read-only root filesystem, dropped capabilities, no network by default, and writable storage only for bounded temporary data and the disposable workspace. The image contains no Docker client/socket, host checkout, configuration, or credentials. Review changes to any image, package, or snapshot pin as security-sensitive. See [`docs/worker-image.md`](docs/worker-image.md).

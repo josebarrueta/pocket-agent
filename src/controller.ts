@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { SandboxJob, SandboxRunner } from "./sandbox.js";
 import type { ApprovalPort, IncomingMessage, Messenger } from "./types.js";
+import type { JobWorkspace, WorkspacePatch, WorkspaceProvider } from "./workspace.js";
 
 const DEFAULT_JOB_TIMEOUT_MS = 60 * 60 * 1_000;
 const DEFAULT_OUTPUT_LIMIT_BYTES = 1_000_000;
@@ -15,8 +16,10 @@ interface Job {
   conversationId: string;
   repo: string;
   run: SandboxJob;
+  workspace: JobWorkspace;
   state: "idle" | "running" | "cancelled" | "failed";
   lastError?: string;
+  lastPatch?: WorkspacePatch;
 }
 
 export class Controller {
@@ -27,7 +30,7 @@ export class Controller {
     private readonly messenger: Messenger,
     private readonly approvals: ApprovalPort,
     private readonly sandboxes: SandboxRunner,
-    private readonly repositories: Record<string, string>,
+    private readonly workspaces: WorkspaceProvider,
     private readonly options: ControllerOptions = {},
   ) {}
 
@@ -80,8 +83,11 @@ export class Controller {
 
   async close(): Promise<void> {
     await Promise.allSettled([...this.jobs.values()].map(async (job) => {
-      await job.run.cancel();
-      await job.run.dispose();
+      try {
+        await job.run.cancel();
+      } finally {
+        await Promise.allSettled([job.run.dispose(), job.workspace.dispose()]);
+      }
     }));
   }
 
@@ -96,7 +102,7 @@ export class Controller {
       "/jobs — list sessions",
       "/use <job-id> — select a session",
       "/status — active session status",
-      `Repos: ${Object.keys(this.repositories).join(", ")}`,
+      `Repos: ${this.workspaces.aliases.join(", ")}`,
     ].join("\n"));
   }
 
@@ -104,19 +110,23 @@ export class Controller {
     const [repo, ...taskParts] = args;
     const task = taskParts.join(" ").trim();
     if (!repo || !task) throw new Error(`Usage: ${bug ? "/bug" : "/new"} <repo> <description>`);
-    const cwd = this.repositories[repo];
-    if (!cwd) throw new Error(`Unknown repo '${repo}'. Available: ${Object.keys(this.repositories).join(", ")}`);
-
     const id = randomUUID().slice(0, 8);
-    const run = await this.sandboxes.create({
-      id,
-      workspacePath: cwd,
-      conversationId,
-      deadlineAt: new Date(Date.now() + (this.options.jobTimeoutMs ?? DEFAULT_JOB_TIMEOUT_MS)),
-      outputLimitBytes: this.options.outputLimitBytes ?? DEFAULT_OUTPUT_LIMIT_BYTES,
-      events: { status: (text) => this.messenger.send(conversationId, `[${id}] ${text}`) },
-    });
-    const job: Job = { id, conversationId, repo, run, state: "idle" };
+    const workspace = await this.workspaces.create(id, repo);
+    let run: SandboxJob;
+    try {
+      run = await this.sandboxes.create({
+        id,
+        workspacePath: workspace.path,
+        conversationId,
+        deadlineAt: new Date(Date.now() + (this.options.jobTimeoutMs ?? DEFAULT_JOB_TIMEOUT_MS)),
+        outputLimitBytes: this.options.outputLimitBytes ?? DEFAULT_OUTPUT_LIMIT_BYTES,
+        events: { status: (text) => this.messenger.send(conversationId, `[${id}] ${text}`) },
+      });
+    } catch (error) {
+      await workspace.dispose();
+      throw error;
+    }
+    const job: Job = { id, conversationId, repo, run, workspace, state: "idle" };
     this.jobs.set(id, job);
     this.activeByConversation.set(conversationId, id);
     await this.messenger.send(conversationId, `🚀 [${id}] Starting in ${repo}.`);
@@ -130,6 +140,7 @@ export class Controller {
     if (!text.trim()) throw new Error("Message cannot be empty");
     const job = this.activeJob(conversationId);
     if (job.state === "cancelled") throw new Error("Active job was cancelled; create a new one with /new");
+    if (job.state === "failed") throw new Error("Active job failed and was disposed; create a new one with /new");
     if (job.run.isRunning) {
       await job.run.steer(text);
       await this.messenger.send(conversationId, `↪️ [${job.id}] Steering message queued.`);
@@ -141,12 +152,18 @@ export class Controller {
   private runTurn(conversationId: string, job: Job, prompt: string): void {
     job.state = "running";
     void job.run.start(prompt).then(async (answer) => {
+      job.lastPatch = await job.workspace.exportPatch();
       job.state = "idle";
-      await this.sendLong(conversationId, `✅ [${job.id}]\n${answer}`);
+      const changed = job.lastPatch.files.length
+        ? `\n\nCandidate patch: ${job.lastPatch.files.map((file) => `${file.status} ${JSON.stringify(file.path)}`).join(", ")}`
+        : "";
+      await this.sendLong(conversationId, `✅ [${job.id}]\n${answer}${changed}`);
     }).catch(async (error: unknown) => {
       if (job.state === "cancelled") return;
       job.state = "failed";
       job.lastError = error instanceof Error ? error.message : String(error);
+      this.approvals.cancelScope(conversationId, job.id);
+      await Promise.allSettled([job.run.dispose(), job.workspace.dispose()]);
       await this.messenger.send(conversationId, `❌ [${job.id}] ${job.lastError}`);
     });
   }
@@ -157,8 +174,11 @@ export class Controller {
     if (!job || job.conversationId !== conversationId) throw new Error("No matching job");
     this.approvals.cancelScope(conversationId, job.id);
     job.state = "cancelled";
-    await job.run.cancel();
-    await job.run.dispose();
+    try {
+      await job.run.cancel();
+    } finally {
+      await Promise.allSettled([job.run.dispose(), job.workspace.dispose()]);
+    }
     await this.messenger.send(conversationId, `🛑 [${job.id}] Cancelled.`);
   }
 

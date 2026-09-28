@@ -1,10 +1,11 @@
 #!/usr/bin/env node
-import { resolve } from "node:path";
+import { join, resolve } from "node:path";
 import { MessageApprovalBroker } from "./approvals.js";
 import { loadConfig } from "./config.js";
 import { Controller } from "./controller.js";
 import { PiSandboxRunner } from "./pi-agent.js";
 import { SignalMessenger } from "./signal.js";
+import { DisposableWorkspaceManager } from "./workspace.js";
 
 async function main(): Promise<void> {
   const configPath = resolve(process.argv[2] ?? process.env.POCKET_AGENT_CONFIG ?? "config.json");
@@ -16,7 +17,9 @@ async function main(): Promise<void> {
   );
   const approvals = new MessageApprovalBroker(messenger);
   const sandboxes = new PiSandboxRunner(config, approvals);
-  const controller = new Controller(messenger, approvals, sandboxes, config.repositories);
+  const workspaces = new DisposableWorkspaceManager(join(config.stateDir, "workspaces"), config.repositories);
+  await workspaces.reclaimStale(new Date());
+  const controller = new Controller(messenger, approvals, sandboxes, workspaces);
 
   let shuttingDown = false;
   const shutdown = async () => {

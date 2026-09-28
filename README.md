@@ -63,6 +63,7 @@ The deep seams are intentionally small:
 - `/answer` resolves agent questions, Pi tool approvals and MCP approvals.
 - `/cancel`, `/jobs`, `/use`, and `/status` control concurrent sessions.
 - Incoming senders and repositories are host-configured allowlists.
+- Jobs use bounded disposable repository snapshots; candidate patches are exported with a changed-file manifest while the original checkout remains untouched.
 - Pi writes and shell calls default to explicit approval.
 - MCP uses local stdio only, absolute executables, no shell, deny-by-default tool policy, timeouts and output limits.
 - Signal group messages are ignored in the MVP; only allowlisted private senders are accepted.
