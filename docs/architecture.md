@@ -77,6 +77,15 @@ interface SandboxRunner {
   create(spec: JobSandboxSpec): Promise<SandboxJob>;
 }
 
+interface JobSandboxSpec {
+  id: string;
+  workspacePath: string;
+  conversationId: string;
+  deadlineAt: Date;
+  outputLimitBytes: number;
+  events: { status(message: string): Promise<void> };
+}
+
 interface SandboxJob {
   start(prompt: string): Promise<string>;
   steer(message: string): Promise<void>;
@@ -85,7 +94,7 @@ interface SandboxJob {
 }
 ```
 
-Its implementation owns container or VM creation, limits, networking, workspace initialization, process supervision, and cleanup. Docker is a practical first adapter; a VM or native OS sandbox can be added at the same seam later.
+Its implementation owns container or VM creation, limits, networking, workspace initialization, process supervision, and cleanup. Docker is a practical first adapter; a VM or native OS sandbox can be added at the same seam later. The versioned start, steer, cancel, status, completion, and failure messages—and their lifecycle invariants—are specified in [`worker-protocol.md`](worker-protocol.md).
 
 ### Capability broker
 
@@ -144,7 +153,7 @@ MCP is the mediation protocol, not the isolation mechanism. The sandbox provides
 
 The current MVP runs the Pi SDK in the Pocket Agent host process. Pi's built-in read, write, and shell tools therefore execute with the daemon user's host privileges after policy or approval checks. The existing MCP gateway constrains configured MCP servers, but it does not isolate Pi itself.
 
-Moving to this target architecture requires replacing the in-process `PiAgentFactory` adapter with a sandbox adapter, disabling host-side built-in execution, and moving privileged interactions behind the capability broker. Until that work is complete, approvals must not be treated as a security boundary.
+Moving to this target architecture requires replacing the transitional in-process `PiSandboxRunner` adapter with an isolated sandbox adapter, disabling host-side built-in execution, and moving privileged interactions behind the capability broker. Until that work is complete, approvals must not be treated as a security boundary.
 
 ## Recommended migration order
 

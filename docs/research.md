@@ -14,7 +14,7 @@ WhatsApp is feasible through Meta's official Cloud API, but it is designed for b
 
 Pi is a good first agent because its SDK embeds a session directly, streams lifecycle/tool events, supports steering and follow-ups while running, and exposes `abort()` for cancellation. Persistent `SessionManager`s preserve conversation state. Pi extensions can register an `ask_operator` tool and can block tool calls before execution. [Pi SDK documentation](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/sdk.md) and [extension documentation](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/extensions.md).
 
-Other agents should sit behind the project's `AgentFactory`/`AgentRun` seam. Claude Code, Codex, and other ACP-capable tools can be added without changing message routing. The reference project, acpbot, validates the broader shape: separate messaging and agent-host concerns, session control, queue/steer, cancellation, permissions, and MCP. [acpbot README](https://github.com/pmdroid/acpbot) and [security policy](https://github.com/pmdroid/acpbot/blob/main/SECURITY.md).
+Other agents should sit behind the project's `SandboxRunner`/`SandboxJob` seam. Claude Code, Codex, and other ACP-capable tools can be added without changing message routing. The reference project, acpbot, validates the broader shape: separate messaging and agent-host concerns, session control, queue/steer, cancellation, permissions, and MCP. [acpbot README](https://github.com/pmdroid/acpbot) and [security policy](https://github.com/pmdroid/acpbot/blob/main/SECURITY.md).
 
 ## MCP and safety
 

@@ -52,7 +52,7 @@ Arbitrary agent-selected commands run only inside a disposable worker. The worke
 The deep seams are intentionally small:
 
 - `Messenger`: incoming messages and outbound text. A WhatsApp adapter can replace Signal.
-- `AgentFactory` / `AgentRun`: start, steer, cancel and dispose. ACP/Claude Code/Codex adapters can be added later.
+- `SandboxRunner` / `SandboxJob`: create, start, steer, cancel and dispose isolated jobs. The current in-process Pi adapter is transitional; Docker and VM adapters fit the same seam.
 - `ApprovalPort`: turns blocking agent questions and tool permissions into chat requests.
 
 ## Current capabilities

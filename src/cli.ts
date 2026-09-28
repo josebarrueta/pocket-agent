@@ -3,7 +3,7 @@ import { resolve } from "node:path";
 import { MessageApprovalBroker } from "./approvals.js";
 import { loadConfig } from "./config.js";
 import { Controller } from "./controller.js";
-import { PiAgentFactory } from "./pi-agent.js";
+import { PiSandboxRunner } from "./pi-agent.js";
 import { SignalMessenger } from "./signal.js";
 
 async function main(): Promise<void> {
@@ -15,8 +15,8 @@ async function main(): Promise<void> {
     config.signal.allowedSenders,
   );
   const approvals = new MessageApprovalBroker(messenger);
-  const agents = new PiAgentFactory(config, approvals);
-  const controller = new Controller(messenger, approvals, agents, config.repositories);
+  const sandboxes = new PiSandboxRunner(config, approvals);
+  const controller = new Controller(messenger, approvals, sandboxes, config.repositories);
 
   let shuttingDown = false;
   const shutdown = async () => {

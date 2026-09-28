@@ -12,7 +12,8 @@ import {
 import { Type } from "typebox";
 import type { AppConfig, ToolDecision } from "./config.js";
 import { createMcpExtension } from "./mcp.js";
-import type { AgentFactory, AgentRun, ApprovalPort } from "./types.js";
+import { SandboxFailure, type JobSandboxSpec, type SandboxJob, type SandboxRunner } from "./sandbox.js";
+import type { ApprovalPort } from "./types.js";
 
 function decisionFor(toolName: string, permissions: AppConfig["agent"]["permissions"]): ToolDecision {
   if (["read", "grep", "find", "ls"].includes(toolName)) return permissions.read;
@@ -21,13 +22,14 @@ function decisionFor(toolName: string, permissions: AppConfig["agent"]["permissi
   return "allow";
 }
 
-export class PiAgentFactory implements AgentFactory {
+/** Transitional in-process adapter; a container adapter will replace it. */
+export class PiSandboxRunner implements SandboxRunner {
   constructor(
     private readonly config: AppConfig,
     private readonly approvals: ApprovalPort,
   ) {}
 
-  async create(options: Parameters<AgentFactory["create"]>[0]): Promise<AgentRun> {
+  async create(options: JobSandboxSpec): Promise<SandboxJob> {
     const sessionDir = join(this.config.stateDir, "pi-sessions");
     await mkdir(sessionDir, { recursive: true });
 
@@ -75,9 +77,9 @@ export class PiAgentFactory implements AgentFactory {
     };
 
     const agentDir = getAgentDir();
-    const settingsManager = SettingsManager.create(options.cwd, agentDir, { projectTrusted: false });
+    const settingsManager = SettingsManager.create(options.workspacePath, agentDir, { projectTrusted: false });
     const resourceLoader = new DefaultResourceLoader({
-      cwd: options.cwd,
+      cwd: options.workspacePath,
       agentDir,
       settingsManager,
       noExtensions: true,
@@ -100,52 +102,73 @@ export class PiAgentFactory implements AgentFactory {
     }
 
     const created = await createAgentSession({
-      cwd: options.cwd,
+      cwd: options.workspacePath,
       modelRuntime,
       resourceLoader,
       settingsManager,
-      sessionManager: SessionManager.create(options.cwd, sessionDir),
+      sessionManager: SessionManager.create(options.workspacePath, sessionDir),
       thinkingLevel: this.config.agent.thinking,
       ...(model ? { model } : {}),
     });
 
-    return new PiAgentRun(options.id, created.session, options.events, async () => {
+    return new PiSandboxJob(options, created.session, async () => {
       created.session.dispose();
       await mcp.close();
     });
   }
 }
 
-class PiAgentRun implements AgentRun {
+class PiSandboxJob implements SandboxJob {
   private running = false;
+  private cancelled = false;
   private disposed = false;
   private lastToolStatusAt = 0;
 
   constructor(
-    readonly id: string,
+    private readonly spec: JobSandboxSpec,
     private readonly session: Awaited<ReturnType<typeof createAgentSession>>["session"],
-    private readonly events: { status(message: string): Promise<void> },
     private readonly cleanup: () => Promise<void>,
   ) {
     session.subscribe((event) => {
       if (event.type === "tool_execution_start" && Date.now() - this.lastToolStatusAt > 5_000) {
         this.lastToolStatusAt = Date.now();
-        void this.events.status(`🔧 ${event.toolName}`).catch(console.error);
+        if (!this.disposed) void this.spec.events.status(`🔧 ${event.toolName}`).catch(console.error);
       }
     });
   }
+
+  get id(): string { return this.spec.id; }
 
   get isRunning(): boolean {
     return this.running;
   }
 
   async start(prompt: string): Promise<string> {
-    if (this.running) throw new Error("agent is already running");
+    if (this.disposed) throw new Error("Sandbox job is disposed");
+    if (this.cancelled) throw new Error("Sandbox job is cancelled");
+    if (this.running) throw new Error("Sandbox job is already running");
+    const remaining = this.spec.deadlineAt.getTime() - Date.now();
+    if (remaining <= 0) throw new SandboxFailure("Sandbox job deadline exceeded", "deadline_exceeded", false);
+
     this.running = true;
+    let timer: ReturnType<typeof setTimeout> | undefined;
     try {
-      await this.session.prompt(prompt);
-      return this.session.getLastAssistantText() || "(Agent completed without a text response.)";
+      await Promise.race([
+        this.session.prompt(prompt),
+        new Promise<never>((_resolve, reject) => {
+          timer = setTimeout(() => {
+            void this.session.abort();
+            reject(new SandboxFailure("Sandbox job deadline exceeded", "deadline_exceeded", false));
+          }, remaining);
+        }),
+      ]);
+      const output = this.session.getLastAssistantText() || "(Agent completed without a text response.)";
+      if (Buffer.byteLength(output, "utf8") > this.spec.outputLimitBytes) {
+        throw new SandboxFailure("Worker output exceeded its byte limit", "output_limit_exceeded", false);
+      }
+      return output;
     } finally {
+      if (timer) clearTimeout(timer);
       this.running = false;
     }
   }
@@ -159,6 +182,8 @@ class PiAgentRun implements AgentRun {
   }
 
   async cancel(): Promise<void> {
+    if (this.cancelled || this.disposed) return;
+    this.cancelled = true;
     await this.session.abort();
     this.running = false;
   }
@@ -166,6 +191,12 @@ class PiAgentRun implements AgentRun {
   async dispose(): Promise<void> {
     if (this.disposed) return;
     this.disposed = true;
-    await this.cleanup();
+    this.cancelled = true;
+    try {
+      if (this.running) await this.session.abort();
+    } finally {
+      this.running = false;
+      await this.cleanup();
+    }
   }
 }

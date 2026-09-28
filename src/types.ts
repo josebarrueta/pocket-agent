@@ -29,25 +29,3 @@ export interface ApprovalPort {
   answer(conversationId: ConversationId, requestId: string, answer: string): boolean;
   cancelScope(conversationId: ConversationId, scopeId: string): void;
 }
-
-export interface AgentEvents {
-  status(message: string): Promise<void>;
-}
-
-export interface AgentRun {
-  readonly id: string;
-  readonly isRunning: boolean;
-  start(prompt: string): Promise<string>;
-  steer(message: string): Promise<void>;
-  cancel(): Promise<void>;
-  dispose(): Promise<void>;
-}
-
-export interface AgentFactory {
-  create(options: {
-    id: string;
-    cwd: string;
-    conversationId: ConversationId;
-    events: AgentEvents;
-  }): Promise<AgentRun>;
-}

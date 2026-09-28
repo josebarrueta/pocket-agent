@@ -1,11 +1,20 @@
 import { randomUUID } from "node:crypto";
-import type { AgentFactory, AgentRun, ApprovalPort, IncomingMessage, Messenger } from "./types.js";
+import type { SandboxJob, SandboxRunner } from "./sandbox.js";
+import type { ApprovalPort, IncomingMessage, Messenger } from "./types.js";
+
+const DEFAULT_JOB_TIMEOUT_MS = 60 * 60 * 1_000;
+const DEFAULT_OUTPUT_LIMIT_BYTES = 1_000_000;
+
+interface ControllerOptions {
+  jobTimeoutMs?: number;
+  outputLimitBytes?: number;
+}
 
 interface Job {
   id: string;
   conversationId: string;
   repo: string;
-  run: AgentRun;
+  run: SandboxJob;
   state: "idle" | "running" | "cancelled" | "failed";
   lastError?: string;
 }
@@ -17,8 +26,9 @@ export class Controller {
   constructor(
     private readonly messenger: Messenger,
     private readonly approvals: ApprovalPort,
-    private readonly agents: AgentFactory,
+    private readonly sandboxes: SandboxRunner,
     private readonly repositories: Record<string, string>,
+    private readonly options: ControllerOptions = {},
   ) {}
 
   async handle(message: IncomingMessage): Promise<void> {
@@ -98,10 +108,12 @@ export class Controller {
     if (!cwd) throw new Error(`Unknown repo '${repo}'. Available: ${Object.keys(this.repositories).join(", ")}`);
 
     const id = randomUUID().slice(0, 8);
-    const run = await this.agents.create({
+    const run = await this.sandboxes.create({
       id,
-      cwd,
+      workspacePath: cwd,
       conversationId,
+      deadlineAt: new Date(Date.now() + (this.options.jobTimeoutMs ?? DEFAULT_JOB_TIMEOUT_MS)),
+      outputLimitBytes: this.options.outputLimitBytes ?? DEFAULT_OUTPUT_LIMIT_BYTES,
       events: { status: (text) => this.messenger.send(conversationId, `[${id}] ${text}`) },
     });
     const job: Job = { id, conversationId, repo, run, state: "idle" };
