@@ -12,18 +12,58 @@ Signal works for a private, self-hosted workflow through the unofficial `signal-
 
 ## Architecture
 
-```text
-Signal app
-   │ encrypted Signal message
-   ▼
-signal-cli (loopback only)
-   │ SSE + JSON-RPC
-   ▼
-Message adapter ──► Controller ──► AgentRun seam ──► Pi SDK
-                         │                         ├─ built-in tools + approvals
-                         │                         └─ MCP gateway + approvals
-                         └─ sessions / cancel / steer
+```mermaid
+flowchart LR
+    operator["Operator<br/>Signal app"]
+    signal["Signal service"]
+
+    subgraph host["Developer machine"]
+        direction LR
+
+        subgraph container["Hardened Signal containers"]
+            daemon["signal-cli daemon<br/>minimal scratch image"]
+            linker["One-off link helper<br/>stopped after setup"]
+            keys[("Linked-device keys")]
+            linker -.->|writes once| keys
+            daemon <--> keys
+        end
+
+        subgraph control["Pocket Agent host process"]
+            adapter["SignalMessenger<br/>transport adapter"]
+            controller["Controller<br/>commands and job lifecycle"]
+            approvals["ApprovalPort<br/>ask / allow / deny"]
+            sessions[("Session state")]
+            policy["Host configuration<br/>sender, repo, and tool policy"]
+
+            adapter <--> controller
+            controller <--> sessions
+            controller <--> approvals
+            policy -.->|allowlists and defaults| controller
+            policy -.->|permission rules| approvals
+        end
+
+        subgraph execution["Agent execution"]
+            pi["Pi SDK session<br/>AgentRun"]
+            tools["Built-in tools<br/>read / write / bash"]
+            gateway["MCP gateway<br/>deny by default"]
+            repos[("Allowlisted repositories")]
+            mcp["Approved MCP servers<br/>local stdio or isolated container"]
+
+            pi --> tools --> repos
+            pi --> gateway --> mcp
+        end
+
+        daemon <-->|"SSE events / JSON-RPC sends<br/>127.0.0.1:8080 only"| adapter
+        controller <-->|"start, steer, cancel, progress"| pi
+        approvals -.->|tool decisions| pi
+        approvals -.->|tool decisions| gateway
+    end
+
+    operator <-->|"end-to-end encrypted messages"| signal
+    signal <-->|"Signal protocol<br/>outbound network only"| daemon
 ```
+
+Commands arrive through the SSE stream; replies and progress use JSON-RPC in the reverse direction. The Signal daemon is isolated from agent execution and exposes its API only on host loopback. The controller accepts only configured senders and repository aliases, while Pi tool calls and MCP calls pass through explicit policy and approval points before reaching local resources.
 
 The deep seams are intentionally small:
 
