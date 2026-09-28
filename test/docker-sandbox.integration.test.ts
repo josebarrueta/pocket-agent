@@ -159,7 +159,7 @@ integration("job worker reaches only its authenticated capability scope over pri
   assert.equal(brokerMount.Type, "bind");
   assert.equal(brokerMount.RW, false);
 
-  assert.equal(await job.start("broker-list"), "turn:broker-list");
+  assert.equal(await job.start("broker-list"), "completed broker-list");
   const response = JSON.parse(await readFile(join(workspace, "broker.json"), "utf8"));
   assert.deepEqual(response.result.tools.map((tool: { name: string }) => tool.name), ["workspace.read_metadata"]);
   await job.dispose();
