@@ -71,6 +71,7 @@ function smokeTest() {
 async function createSession() {
   if (process.env.POCKET_AGENT_DISABLE_MODEL === "1") throw new Error("model execution disabled for protocol test");
   await mkdir(AGENT_DIR, { recursive: true, mode: 0o700 });
+  const { createAssistantMessageEventStream } = await import("@earendil-works/pi-ai/compat");
   const { Type } = await import("typebox");
   const {
     createAgentSession,
@@ -101,6 +102,29 @@ async function createSession() {
         choices: ["yes", "no"],
       });
       if (answer !== "yes") return { block: true, reason: "Denied by operator" };
+    });
+  };
+  const proxyDescriptor = parseProxyModel();
+  const proxyModel = proxyDescriptor ? {
+    ...proxyDescriptor,
+    provider: "pocket-agent-proxy",
+    api: "pocket-agent-proxy",
+    baseUrl: "unix://pocket-agent-model-proxy",
+    input: [...proxyDescriptor.input],
+    cost: { ...proxyDescriptor.cost },
+  } : undefined;
+  const modelProxyExtension = (pi) => {
+    if (!proxyDescriptor || !proxyModel) return;
+    const streamProxy = (_model, context, options = {}) => {
+      const stream = createAssistantMessageEventStream();
+      void streamModelProxy(proxyDescriptor, proxyModel, context, options, stream);
+      return stream;
+    };
+    pi.registerProvider("pocket-agent-proxy", {
+      api: "pocket-agent-proxy",
+      apiKey: "job-scoped-proxy",
+      models: [proxyModel],
+      streamSimple: streamProxy,
     });
   };
   const capabilityExtension = async (pi) => {
@@ -139,7 +163,7 @@ async function createSession() {
     noSkills: true,
     noPromptTemplates: true,
     noThemes: true,
-    extensionFactories: [approvalExtension, capabilityExtension],
+    extensionFactories: [approvalExtension, capabilityExtension, modelProxyExtension],
   });
   await resourceLoader.reload();
   const extensionErrors = resourceLoader.getExtensions().errors;
@@ -151,7 +175,9 @@ async function createSession() {
   });
   let model;
   const configuredModel = process.env.POCKET_AGENT_MODEL;
-  if (configuredModel) {
+  if (proxyModel) {
+    model = proxyModel;
+  } else if (configuredModel) {
     const separator = configuredModel.indexOf("/");
     if (separator < 1 || separator === configuredModel.length - 1) throw new Error("POCKET_AGENT_MODEL must be provider/model-id");
     model = modelRuntime.getModel(configuredModel.slice(0, separator), configuredModel.slice(separator + 1));
@@ -240,6 +266,125 @@ async function cancelRun(message) {
   } catch {
     // The host force-removes the sandbox after cancellation.
   }
+}
+
+function parseProxyModel() {
+  const raw = process.env.POCKET_AGENT_PROXY_MODEL;
+  if (!raw) return undefined;
+  if (!process.env.POCKET_AGENT_MODEL_SOCKET || !process.env.POCKET_AGENT_MODEL_CREDENTIAL || !process.env.POCKET_AGENT_JOB_ID) {
+    throw new Error("Model proxy configuration is incomplete");
+  }
+  let value;
+  try { value = JSON.parse(raw); } catch { throw new Error("Model proxy descriptor is malformed"); }
+  if (!isRecord(value) || !nonEmptyString(value.provider, 128) || !nonEmptyString(value.id, 256) ||
+      !nonEmptyString(value.name, 256) || typeof value.reasoning !== "boolean" ||
+      !Array.isArray(value.input) || !value.input.every((item) => ["text", "image"].includes(item)) ||
+      !isRecord(value.cost) || !["input", "output", "cacheRead", "cacheWrite"].every((key) => typeof value.cost[key] === "number") ||
+      !Number.isSafeInteger(value.contextWindow) || value.contextWindow <= 0 ||
+      !Number.isSafeInteger(value.maxTokens) || value.maxTokens <= 0) {
+    throw new Error("Model proxy descriptor is invalid");
+  }
+  return value;
+}
+
+async function streamModelProxy(descriptor, proxyModel, context, options, stream) {
+  const body = JSON.stringify({
+    provider: descriptor.provider,
+    model: descriptor.id,
+    context,
+    options: {
+      ...(options.reasoning ? { reasoning: options.reasoning } : {}),
+      ...(typeof options.temperature === "number" ? { temperature: options.temperature } : {}),
+      ...(options.toolChoice ? { toolChoice: options.toolChoice } : {}),
+    },
+  });
+  let request;
+  try {
+    await new Promise((resolve, reject) => {
+      request = httpRequest({
+        socketPath: process.env.POCKET_AGENT_MODEL_SOCKET,
+        path: "/v1/stream",
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${process.env.POCKET_AGENT_MODEL_CREDENTIAL}`,
+          "x-pocket-agent-job-id": process.env.POCKET_AGENT_JOB_ID,
+          "content-type": "application/json",
+          "content-length": Buffer.byteLength(body),
+        },
+      }, (response) => {
+        if (response.statusCode !== 200) {
+          const chunks = [];
+          response.on("data", (chunk) => chunks.push(chunk));
+          response.on("end", () => {
+            let message = `Model proxy returned HTTP ${response.statusCode}`;
+            try { message = JSON.parse(Buffer.concat(chunks).toString("utf8")).error ?? message; } catch {}
+            reject(new Error(message));
+          });
+          return;
+        }
+        let buffer = "";
+        let bytes = 0;
+        response.setEncoding("utf8");
+        response.on("data", (chunk) => {
+          bytes += Buffer.byteLength(chunk);
+          if (bytes > MAX_CAPABILITY_RESPONSE_BYTES * 2) return request.destroy(new Error("Model stream exceeded its limit"));
+          buffer += chunk;
+          let newline;
+          while ((newline = buffer.indexOf("\n")) >= 0) {
+            const line = buffer.slice(0, newline);
+            buffer = buffer.slice(newline + 1);
+            if (!line) continue;
+            try {
+              const message = JSON.parse(line);
+              if (message.error) request.destroy(new Error(message.error));
+              else if (message.event) stream.push(rewriteProxyEvent(message.event, proxyModel));
+            } catch (error) { reject(error); }
+          }
+        });
+        response.on("end", () => buffer ? reject(new Error("Model proxy returned a partial event")) : resolve());
+        response.on("error", reject);
+      });
+      request.once("error", reject);
+      if (options.signal) {
+        if (options.signal.aborted) request.destroy(new Error("Model request aborted"));
+        else options.signal.addEventListener("abort", () => request.destroy(new Error("Model request aborted")), { once: true });
+      }
+      request.end(body);
+    });
+  } catch (error) {
+    stream.push({
+      type: "error",
+      reason: options.signal?.aborted ? "aborted" : "error",
+      error: emptyAssistantError(proxyModel, error instanceof Error ? error.message : "Model proxy failed", options.signal?.aborted),
+    });
+  } finally {
+    stream.end();
+  }
+}
+
+function rewriteProxyEvent(event, model) {
+  const rewrite = (message) => ({ ...message, api: model.api, provider: model.provider, model: model.id });
+  if (event.type === "done") return { ...event, message: rewrite(event.message) };
+  if (event.type === "error") return { ...event, error: rewrite(event.error) };
+  if (event.partial) return { ...event, partial: rewrite(event.partial) };
+  return event;
+}
+
+function emptyAssistantError(model, message, aborted = false) {
+  return {
+    role: "assistant",
+    content: [],
+    api: model.api,
+    provider: model.provider,
+    model: model.id,
+    usage: {
+      input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+    },
+    stopReason: aborted ? "aborted" : "error",
+    errorMessage: message.slice(0, MAX_ERROR_BYTES),
+    timestamp: Date.now(),
+  };
 }
 
 function capabilityRpc(method, params, signal) {

@@ -21,6 +21,11 @@
   },
   "agent": {
     "model": "anthropic/claude-sonnet-4-5",
+    "apiKeyEnv": "ANTHROPIC_API_KEY",
+    "modelRequestTimeoutMs": 120000,
+    "modelMaxRequestsPerMinute": 10,
+    "modelMaxTokensPerRequest": 32000,
+    "modelMaxTokensPerJob": 200000,
     "thinking": "medium",
     "permissions": {
       "read": "allow",

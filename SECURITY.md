@@ -10,13 +10,14 @@ Pocket Agent connects a remote message to coding tools that can read files, modi
 - Jobs are scoped to the conversation that created them.
 - Pi and all built-in filesystem/shell tools execute only in a constrained disposable worker.
 - Writes and shell commands require approval by default; approvals are not the isolation seam.
-- Workers have no network access; native Linux workers receive only a short-lived authenticated MCP lease over a private Unix socket. The only production capabilities are scoped workspace metadata and bounded patch submission/status/application.
+- Workers have no network access; native Linux workers receive short-lived authenticated capability and model leases over private Unix sockets. The only host capabilities are scoped workspace metadata and bounded patch submission/status/application.
+- Provider credentials, destinations, and headers stay in the host model proxy; workers receive only fixed model metadata and a revocable job credential.
 
 ## Important limitations
 
 Approvals are not isolation. An allowed shell command can perform any action available inside its worker, and an agent may be prompt-injected by repository content. Docker isolation depends on the host kernel/VM and daemon configuration. Signal transport security does not protect a compromised host or unlocked phone. `signal-cli` is unofficial and stores linked-device keys locally.
 
-The worker currently receives no provider credentials and has no network, so model-backed jobs remain unavailable until the model proxy is implemented. Capability transport currently requires native Linux Docker; Docker Desktop for macOS cannot forward the host Unix socket and access fails closed. Keep secrets out of repositories and the daemon environment, enable backups, review every approval and candidate patch, and pin worker image digests. Never publish the Signal daemon port; the supplied compose file binds it to loopback.
+The worker receives no provider credentials and has no network; model requests pass through the bounded host proxy. Capability and model transport currently require native Linux Docker. Docker Desktop for macOS cannot forward the host Unix sockets and access fails closed. Keep secrets out of repositories, limit credentials in the daemon environment to the configured provider key, enable backups, review every approval and candidate patch, and pin worker image digests. Never publish the Signal daemon port; the supplied compose file binds it to loopback.
 
 ## Signal image provenance
 

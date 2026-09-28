@@ -10,6 +10,7 @@ const base = {
   signal: { account: "+15550000000", allowedSenders: ["+15550000001"] },
   repositories: { app: "/work/app" },
   sandbox: { runner: "docker", dockerPath: "/usr/bin/docker", image: pinnedImage },
+  agent: { model: "anthropic/claude-sonnet-4-5", apiKeyEnv: "ANTHROPIC_API_KEY" },
 };
 
 async function withConfig(value: unknown, run: (path: string) => Promise<void>): Promise<void> {
@@ -32,6 +33,17 @@ test("production configuration requires the Docker sandbox", async () => {
   const { sandbox: _sandbox, ...withoutSandbox } = base;
   await withConfig(withoutSandbox, async (path) => {
     await assert.rejects(loadConfig(path), /sandbox/);
+  });
+});
+
+test("model proxy configuration requires a fixed model and credential variable", async () => {
+  await withConfig({ ...base, agent: { model: "invalid", apiKeyEnv: "secret" } }, async (path) => {
+    await assert.rejects(loadConfig(path), /model|apiKeyEnv/);
+  });
+  await withConfig(base, async (path) => {
+    const config = await loadConfig(path);
+    assert.equal(config.agent.modelMaxRequestsPerMinute, 10);
+    assert.equal(config.agent.modelMaxTokensPerJob, 200_000);
   });
 });
 

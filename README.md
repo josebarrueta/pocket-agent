@@ -4,7 +4,7 @@ A private Signal control plane for a coding agent running on your machine.
 
 From Signal you can report a bug, start a Pi task in an allowlisted repository, receive progress and final output, answer questions/permission prompts, steer active work, cancel it, and switch between sessions. MCP tools are exposed through a deny-by-default gateway.
 
-> **Early MVP:** use on a development machine with backups. Pi and its built-in tools run only in a constrained disposable Docker worker. The authenticated broker exposes only scoped workspace metadata and patch review/application tools; the model proxy is still under construction.
+> **Early MVP:** use on a development machine with backups. Pi and its built-in tools run only in a constrained disposable Docker worker. The authenticated broker exposes only scoped workspace operations, and a job-scoped host proxy keeps provider credentials out of workers.
 
 ## Why Signal first?
 
@@ -47,7 +47,7 @@ flowchart LR
 
 Arbitrary agent-selected commands run only inside a disposable worker. The worker receives a repository copy, not the original host checkout, and has no host home directory, Docker socket, or long-lived credentials. Privileged actions cross an authenticated MCP seam where the trusted capability broker validates job identity, scope, normalized arguments, policy, and operator approval. The broker exposes typed capabilities and never a generic host shell.
 
-Pi execution and built-in tools run in the isolated worker; the host package does not install or initialize Pi. The host issues short-lived, job-scoped broker leases over a private Unix-socket transport with normalized policy checks, one-operation approvals, limits, revocation, and redacted audit records. Curated workspace capabilities can submit and review a patch; applying it is a separate approved operation. The credential-free model proxy remains target work. See [`docs/architecture.md`](docs/architecture.md), [`docs/capability-broker.md`](docs/capability-broker.md), and [`docs/workspaces.md`](docs/workspaces.md).
+Pi execution and built-in tools run in the isolated worker; the host package does not install or initialize Pi. The host issues short-lived, job-scoped broker and model-proxy leases over private Unix sockets with policy checks, limits, revocation, and redacted audit records. Curated workspace capabilities can submit and review a patch; applying it is a separate approved operation. Provider credentials remain in the trusted host. See [`docs/architecture.md`](docs/architecture.md), [`docs/capability-broker.md`](docs/capability-broker.md), [`docs/model-proxy.md`](docs/model-proxy.md), and [`docs/workspaces.md`](docs/workspaces.md).
 
 The deep seams are intentionally small:
 
@@ -136,15 +136,19 @@ Edit `config.json`:
 - `allowedSenders`: exact trusted sender number(s) or UUID(s). Pairing is never performed over chat.
 - `repositories`: chat-safe aliases mapped to absolute local paths.
 - `sandbox.image`: the complete digest-pinned worker image reference from the build.
-- `agent.model`: optional `provider/model-id`; model access will use the job-scoped proxy added in issue #8.
+- `agent.model`: required `provider/model-id`, fixed for all job leases.
+- `agent.apiKeyEnv`: host environment variable containing that provider's API key; its value is never passed to workers.
 - `permissions`: `allow`, `ask`, or `deny` for reads, writes, and shell calls inside the worker.
 
-Then:
+Then export only the configured host credential and start the daemon:
 
 ```bash
+export ANTHROPIC_API_KEY='...'
 npm run check
 npm run dev -- ./config.json
 ```
+
+Use the variable named by `agent.apiKeyEnv`; the example above matches `config.example.json`.
 
 Send `/help` to the linked account from an allowlisted Signal account.
 
@@ -182,11 +186,10 @@ The old host-side MCP extension was removed with host-side Pi. MCP servers are e
 
 ## Deliberate MVP limits / roadmap
 
-1. Add the job-scoped model proxy so isolated Pi sessions can reach configured models without provider credentials.
-2. Add additional narrowly scoped connector capabilities as needed.
-3. Add crash-safe controller job metadata restoration; worker Pi sessions are intentionally in-memory today.
-4. Add adversarial end-to-end isolation tests and an official WhatsApp adapter.
-5. Add attachments, schedules, and richer progress summaries.
+1. Add additional narrowly scoped connector capabilities as needed.
+2. Add crash-safe controller job metadata restoration; worker Pi sessions are intentionally in-memory today.
+3. Complete the adversarial end-to-end isolation matrix and add an official WhatsApp adapter.
+4. Add attachments, schedules, and richer progress summaries.
 
 ## Development
 

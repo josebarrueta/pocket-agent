@@ -122,7 +122,7 @@ This avoids giving compromised worker code a path to unrelated repositories, hos
 
 ### Model proxy
 
-The worker needs model access but should not receive the operator's provider credentials. A narrow proxy owns those credentials, binds requests to a job, restricts providers/models, and applies token and rate limits. The worker network allows only the model proxy and MCP gateway unless a job receives a specific egress capability.
+The worker reaches a narrow host proxy over a private Unix socket and never receives provider credentials. The proxy binds requests to a job, fixes the configured provider/model and destination, applies concurrency, token, rate, byte, and timeout limits, redacts operational records, and revokes access with the sandbox. Details are in [`model-proxy.md`](model-proxy.md). Workers retain `network=none`; the broker and model proxy are explicit socket mounts, not general egress.
 
 ## Sandbox invariants
 
@@ -157,7 +157,7 @@ MCP is the mediation protocol, not the isolation mechanism. The sandbox provides
 
 Pi, its built-in read/write/bash tools, and its in-memory session now run only inside the Docker worker. The host package no longer installs Pi or exposes a host-side agent/MCP adapter. Workers receive only a disposable workspace, safe model-selection metadata, and normalized approval responses; they receive no host environment or credentials.
 
-The host exposes an authenticated, job-scoped MCP broker over a private Unix socket mounted read-only into native Linux workers. The worker registers its scoped tools with Pi, and the broker currently exposes only metadata, patch submission/status, and separately approved patch application. The credential-free model proxy is still pending, so production workers cannot reach model providers. Docker Desktop for macOS cannot forward the host Unix socket and fails capability access closed. Approvals reduce accidental tool use inside the disposable workspace; sandbox isolation—not approval—is the security seam.
+The host exposes authenticated, job-scoped broker and model-proxy Unix sockets mounted read-only into native Linux workers. The worker registers its scoped tools and proxy provider with Pi. The broker exposes only metadata, patch submission/status, and separately approved patch application; the model proxy fixes one trusted provider/model without disclosing its credential. Docker Desktop for macOS cannot forward host Unix sockets and fails both paths closed. Approvals reduce accidental tool use inside the disposable workspace; sandbox isolation—not approval—is the security seam.
 
 ## Recommended migration order
 

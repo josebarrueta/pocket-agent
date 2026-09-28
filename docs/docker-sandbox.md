@@ -23,7 +23,7 @@ Build and publish the worker image from [`worker-image.md`](worker-image.md), th
 
 The Docker executable path must be absolute and the configured image must use a `sha256` digest. The daemon reconciles labeled containers and volumes from a previous run before accepting messages. Run only one controller against a Docker daemon because reconciliation intentionally removes every resource carrying the `pocket-agent.managed=true` label.
 
-Docker is the only production runner. The host forwards only configured model/thinking identifiers, tool policy, and a short-lived capability lease; it does not forward provider credentials or its ambient environment. On native Linux, the broker Unix-socket directory is the sole read-only host bind mount. It grants access only after job authentication and is documented in [`capability-broker.md`](capability-broker.md). Model traffic remains unavailable until the job-scoped proxy from issue #8 is connected through a private network.
+Docker is the only production runner. The host forwards only safe model metadata, tool policy, and short-lived capability/model credentials; it does not forward provider credentials or its ambient environment. On native Linux, the broker and model-proxy Unix-socket directories are the only read-only host bind mounts. Both grant access only after job authentication and are documented in [`capability-broker.md`](capability-broker.md) and [`model-proxy.md`](model-proxy.md). The worker remains `network=none`.
 
 ## Effective controls
 

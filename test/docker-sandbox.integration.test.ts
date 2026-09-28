@@ -7,6 +7,7 @@ import test from "node:test";
 import { promisify } from "node:util";
 import { CapabilityBroker, type CapabilityLeaseRequest } from "../src/capability-broker.js";
 import { DockerSandboxRunner } from "../src/docker-sandbox.js";
+import { ModelProxy, type ModelBackend } from "../src/model-proxy.js";
 import { SandboxFailure } from "../src/sandbox.js";
 import type { ApprovalPort } from "../src/types.js";
 
@@ -183,6 +184,69 @@ integration("job worker reaches only its authenticated capability scope over pri
   });
   await assert.rejects(realWorker.start("initialize capabilities"), /No model is available inside the worker/);
   await realWorker.dispose();
+});
+
+integration("real worker streams through the job model proxy without provider credentials", async (t) => {
+  if (process.platform === "darwin") return t.skip("Docker Desktop cannot forward host Unix sockets through its VM");
+  const root = await mkdtemp(join(tmpdir(), "pocket-docker-model-"));
+  const workspace = join(root, "workspace");
+  await mkdir(workspace);
+  const usage = { input: 2, output: 2, cacheRead: 0, cacheWrite: 0, totalTokens: 4, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
+  const base = { role: "assistant", api: "fake-api", provider: "fake-provider", model: "fake-model", usage, stopReason: "stop", timestamp: Date.now() };
+  const backend: ModelBackend = {
+    descriptor: {
+      provider: "fake-provider", id: "fake-model", name: "Fake model", reasoning: false,
+      input: ["text"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 4096, maxTokens: 256,
+    },
+    async *stream() {
+      yield { type: "start", partial: { ...base, content: [] } } as never;
+      yield { type: "text_start", contentIndex: 0, partial: { ...base, content: [{ type: "text", text: "" }] } } as never;
+      yield { type: "text_delta", contentIndex: 0, delta: "proxy works", partial: { ...base, content: [{ type: "text", text: "proxy works" }] } } as never;
+      yield { type: "text_end", contentIndex: 0, content: "proxy works", partial: { ...base, content: [{ type: "text", text: "proxy works" }] } } as never;
+      yield { type: "done", reason: "stop", message: { ...base, content: [{ type: "text", text: "proxy works" }] } } as never;
+    },
+  };
+  const previousSecret = process.env.POCKET_AGENT_PROVIDER_SECRET;
+  process.env.POCKET_AGENT_PROVIDER_SECRET = "host-provider-secret-must-not-enter-worker";
+  t.after(() => {
+    if (previousSecret === undefined) delete process.env.POCKET_AGENT_PROVIDER_SECRET;
+    else process.env.POCKET_AGENT_PROVIDER_SECRET = previousSecret;
+  });
+  const proxy = new ModelProxy({
+    socketPath: join(root, "model", "model.sock"),
+    auditPath: join(root, "models.ndjson"),
+    backend,
+  });
+  await proxy.start();
+  t.after(async () => { await proxy.close(); await rm(root, { recursive: true, force: true }); });
+  const runner = new DockerSandboxRunner({
+    dockerPath,
+    image: image!,
+    allowUnpinnedImageForTests: true,
+    model: "fake-provider/fake-model",
+    modelLeases: proxy,
+  });
+  const job = await runner.create({
+    id: `model-${process.pid}`,
+    workspacePath: workspace,
+    conversationId: "test",
+    repositoryScope: "repo",
+    deadlineAt: new Date(Date.now() + 30_000),
+    outputLimitBytes: 64 * 1024,
+    events: { status: async () => {} },
+  });
+  t.after(() => job.dispose());
+  const containerId = await docker("ps", "--all", "--quiet", "--filter", `label=pocket-agent.job-id=${job.id}`);
+  const inspected = JSON.parse(await docker("inspect", containerId))[0];
+  const environment = inspected.Config.Env.join("\n");
+  assert.equal(inspected.HostConfig.NetworkMode, "none");
+  const modelMount = inspected.Mounts.find((mount: { Destination: string }) => mount.Destination === "/run/pocket-agent-model");
+  assert.equal(modelMount.Type, "bind");
+  assert.equal(modelMount.RW, false);
+  assert.match(environment, /POCKET_AGENT_MODEL_CREDENTIAL=/);
+  assert.doesNotMatch(environment, /API_KEY|PROVIDER_SECRET|sk-|host-provider-secret-must-not-enter-worker/);
+  assert.doesNotMatch(JSON.stringify(inspected.Config.Cmd ?? []), /host-provider-secret-must-not-enter-worker/);
+  assert.equal(await job.start("respond through proxy"), "proxy works");
 });
 
 integration("sandboxed test tool cannot read host files, environment secrets, or Docker socket", async (t) => {

@@ -5,6 +5,7 @@ import { CapabilityBroker } from "./capability-broker.js";
 import { loadConfig } from "./config.js";
 import { Controller } from "./controller.js";
 import { DockerSandboxRunner } from "./docker-sandbox.js";
+import { ModelProxy, PiModelBackend } from "./model-proxy.js";
 import { SignalMessenger } from "./signal.js";
 import { createWorkspaceCapabilityTools, WORKSPACE_CAPABILITY_NAMES } from "./workspace-capabilities.js";
 import { DisposableWorkspaceManager } from "./workspace.js";
@@ -28,7 +29,28 @@ async function main(): Promise<void> {
     defaultMaxOutputBytes: 6 * 1024 * 1024,
   });
   await capabilityBroker.start();
+  let modelProxy: ModelProxy | undefined;
   try {
+    const separator = config.agent.model.indexOf("/");
+    const provider = config.agent.model.slice(0, separator);
+    const model = config.agent.model.slice(separator + 1);
+    const apiKey = process.env[config.agent.apiKeyEnv];
+    if (!apiKey) throw new Error(`Configured model credential ${config.agent.apiKeyEnv} is not set`);
+    modelProxy = new ModelProxy({
+      socketPath: join(config.stateDir, "model-proxy", "model.sock"),
+      auditPath: join(config.stateDir, "audit", "models.ndjson"),
+      backend: new PiModelBackend({
+        provider,
+        model,
+        apiKey,
+        ...(config.agent.baseUrl ? { baseUrl: config.agent.baseUrl } : {}),
+      }),
+      requestTimeoutMs: config.agent.modelRequestTimeoutMs,
+      defaultMaxRequestsPerMinute: config.agent.modelMaxRequestsPerMinute,
+      defaultMaxTokensPerRequest: config.agent.modelMaxTokensPerRequest,
+      defaultMaxTokensPerJob: config.agent.modelMaxTokensPerJob,
+    });
+    await modelProxy.start();
     const sandboxes = new DockerSandboxRunner({
       dockerPath: config.sandbox.dockerPath,
       image: config.sandbox.image,
@@ -37,6 +59,7 @@ async function main(): Promise<void> {
       permissions: config.agent.permissions,
       capabilityLeases: capabilityBroker,
       allowedCapabilities: WORKSPACE_CAPABILITY_NAMES,
+      modelLeases: modelProxy,
       limits: {
         cpus: config.sandbox.cpus,
         memoryBytes: config.sandbox.memoryBytes,
@@ -55,6 +78,7 @@ async function main(): Promise<void> {
       console.log("Shutting down...");
       await controller.close();
       await capabilityBroker.close();
+      await modelProxy?.close();
       await messenger.close();
     };
     process.once("SIGINT", () => void shutdown());
@@ -63,6 +87,7 @@ async function main(): Promise<void> {
     await messenger.start((message) => controller.handle(message));
     console.log(`Pocket Agent is connected to Signal as ${config.signal.account}`);
   } catch (error) {
+    await modelProxy?.close();
     await capabilityBroker.close();
     throw error;
   }

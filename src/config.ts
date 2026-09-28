@@ -26,16 +26,19 @@ export const configSchema = z.object({
     workspaceStorageBytes: z.number().int().positive().default(805_306_368),
   }),
   agent: z.object({
-    model: z.string().optional(),
+    model: z.string().regex(/^[^/\s]+\/.+$/, "model must be provider/model-id"),
+    apiKeyEnv: z.string().regex(/^[A-Z_][A-Z0-9_]*$/),
+    baseUrl: z.string().url().optional(),
+    modelRequestTimeoutMs: z.number().int().min(1_000).max(30 * 60_000).default(120_000),
+    modelMaxRequestsPerMinute: z.number().int().positive().max(1_000).default(10),
+    modelMaxTokensPerRequest: z.number().int().positive().default(32_000),
+    modelMaxTokensPerJob: z.number().int().positive().default(200_000),
     thinking: z.enum(["off", "minimal", "low", "medium", "high", "xhigh", "max"]).default("medium"),
     permissions: z.object({
       read: toolDecision.default("allow"),
       write: toolDecision.default("ask"),
       bash: toolDecision.default("ask"),
     }).default({ read: "allow", write: "ask", bash: "ask" }),
-  }).default({
-    thinking: "medium",
-    permissions: { read: "allow", write: "ask", bash: "ask" },
   }),
 });
 
