@@ -77,7 +77,7 @@ The deep seams are intentionally small:
 
 ## The worker image
 
-The pinned, multi-platform worker image packages Pi and baseline build tools under numeric UID/GID `65532`. Its restrictive protocol entrypoint runs with a read-only root filesystem and contains no credentials or container client. See [`docs/worker-image.md`](docs/worker-image.md) for builds, hardened smoke tests, SBOM inspection, and the update procedure. Pi execution remains fail-closed in this image until issue #5 moves execution out of the host process.
+The pinned, multi-platform worker image packages Pi and baseline build tools under numeric UID/GID `65532`. Its restrictive protocol entrypoint runs with a read-only root filesystem and contains no credentials or container client. See [`docs/worker-image.md`](docs/worker-image.md) for builds, hardened smoke tests, SBOM inspection, and the update procedure. The [`DockerSandboxRunner`](docs/docker-sandbox.md) adds per-job resource, filesystem, network, lifecycle, and cleanup controls. Pi execution remains fail-closed in this image until issue #5 moves execution out of the host process.
 
 ## The Signal image
 

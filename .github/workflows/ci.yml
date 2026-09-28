@@ -60,3 +60,16 @@ jobs:
             echo "worker accepted malformed input" >&2
             exit 1
           fi
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.19.0
+          cache: npm
+      - run: npm ci
+      - name: Build Docker runner fixture
+        run: docker build --build-arg BASE_IMAGE=pocket-agent/worker:test --file test/fixtures/docker-worker/Dockerfile --tag pocket-agent/worker-fixture:test .
+      - name: Test Docker SandboxRunner
+        env:
+          POCKET_AGENT_DOCKER_TEST_IMAGE: pocket-agent/worker:test
+          POCKET_AGENT_DOCKER_FIXTURE_IMAGE: pocket-agent/worker-fixture:test
+          POCKET_AGENT_DOCKER_PATH: /usr/bin/docker
+        run: node --import tsx --test test/docker-sandbox.integration.test.ts

@@ -31,7 +31,7 @@ Repository aliases resolve only from trusted startup configuration. Jobs receive
 
 ## Worker image provenance
 
-The worker image uses a digest-pinned multi-platform Node base, an immutable Debian package snapshot, and a separate integrity-locked npm dependency tree. It runs as numeric UID/GID `65532`; its intended runtime has a read-only root filesystem, dropped capabilities, no network by default, and writable storage only for bounded temporary data and the disposable workspace. The image contains no Docker client/socket, host checkout, configuration, or credentials. Review changes to any image, package, or snapshot pin as security-sensitive. See [`docs/worker-image.md`](docs/worker-image.md).
+The worker image uses a digest-pinned multi-platform Node base, an immutable Debian package snapshot, and a separate integrity-locked npm dependency tree. It runs as numeric UID/GID `65532`; its Docker runtime has a read-only root filesystem, dropped capabilities, no network by default, and writable storage only for bounded temporary data and the disposable workspace. The image contains no Docker client/socket, host checkout, configuration, or credentials. Review changes to any image, package, snapshot, or runtime control as security-sensitive. See [`docs/worker-image.md`](docs/worker-image.md) and [`docs/docker-sandbox.md`](docs/docker-sandbox.md).
 
 ## Secrets and logs
 

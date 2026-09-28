@@ -25,6 +25,24 @@ export const configSchema = z.object({
     "at least one repository is required",
   ),
   stateDir: z.string().default("~/.local/share/pocket-agent"),
+  sandbox: z.object({
+    runner: z.enum(["in-process", "docker"]).default("in-process"),
+    dockerPath: z.string().default("/usr/local/bin/docker"),
+    image: z.string().optional(),
+    cpus: z.number().positive().max(64).default(1),
+    memoryBytes: z.number().int().positive().default(1_073_741_824),
+    pids: z.number().int().positive().max(4096).default(256),
+    temporaryStorageBytes: z.number().int().positive().default(268_435_456),
+    workspaceStorageBytes: z.number().int().positive().default(805_306_368),
+  }).default({
+    runner: "in-process",
+    dockerPath: "/usr/local/bin/docker",
+    cpus: 1,
+    memoryBytes: 1_073_741_824,
+    pids: 256,
+    temporaryStorageBytes: 268_435_456,
+    workspaceStorageBytes: 805_306_368,
+  }),
   agent: z.object({
     model: z.string().optional(),
     thinking: z.enum(["off", "minimal", "low", "medium", "high", "xhigh", "max"]).default("medium"),
@@ -58,6 +76,13 @@ export async function loadConfig(path: string): Promise<AppConfig> {
   const config = configSchema.parse(parsed);
 
   config.stateDir = expandHome(config.stateDir);
+  if (!isAbsolute(config.sandbox.dockerPath)) throw new Error("sandbox.dockerPath must be absolute");
+  if (config.sandbox.runner === "docker") {
+    if (!config.sandbox.image) throw new Error("sandbox.image is required for the Docker runner");
+    if (!/@sha256:[a-fA-F0-9]{64}$/.test(config.sandbox.image)) {
+      throw new Error("sandbox.image must be pinned by a complete sha256 digest");
+    }
+  }
   for (const [name, repo] of Object.entries(config.repositories)) {
     config.repositories[name] = expandHome(repo);
   }

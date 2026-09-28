@@ -9,6 +9,16 @@
     "website": "/Users/you/code/website"
   },
   "stateDir": "~/.local/share/pocket-agent",
+  "sandbox": {
+    "runner": "in-process",
+    "dockerPath": "/usr/local/bin/docker",
+    "image": "pocket-agent/worker@sha256:PIN_THE_BUILT_IMAGE_DIGEST",
+    "cpus": 1,
+    "memoryBytes": 1073741824,
+    "pids": 256,
+    "temporaryStorageBytes": 268435456,
+    "workspaceStorageBytes": 805306368
+  },
   "agent": {
     "model": "anthropic/claude-sonnet-4-5",
     "thinking": "medium",

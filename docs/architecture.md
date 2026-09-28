@@ -94,7 +94,7 @@ interface SandboxJob {
 }
 ```
 
-Its implementation owns container or VM creation, limits, networking, workspace initialization, process supervision, and cleanup. Docker is a practical first adapter; a VM or native OS sandbox can be added at the same seam later. The versioned start, steer, cancel, status, completion, and failure messages—and their lifecycle invariants—are specified in [`worker-protocol.md`](worker-protocol.md).
+Its implementation owns container or VM creation, limits, networking, workspace initialization, process supervision, and cleanup. The first adapter and its effective controls are documented in [`docker-sandbox.md`](docker-sandbox.md); a VM or native OS sandbox can be added at the same seam later. The versioned start, steer, cancel, status, completion, and failure messages—and their lifecycle invariants—are specified in [`worker-protocol.md`](worker-protocol.md).
 
 ### Capability broker
 

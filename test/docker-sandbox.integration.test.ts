@@ -1,0 +1,199 @@
+import assert from "node:assert/strict";
+import { execFile } from "node:child_process";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import test from "node:test";
+import { promisify } from "node:util";
+import { DockerSandboxRunner } from "../src/docker-sandbox.js";
+import { SandboxFailure } from "../src/sandbox.js";
+
+const execFileAsync = promisify(execFile);
+const image = process.env.POCKET_AGENT_DOCKER_TEST_IMAGE;
+const fixtureImage = process.env.POCKET_AGENT_DOCKER_FIXTURE_IMAGE;
+const dockerPath = process.env.POCKET_AGENT_DOCKER_PATH ?? "/usr/local/bin/docker";
+const integration = image ? test : test.skip;
+
+async function docker(...args: string[]): Promise<string> {
+  const { stdout } = await execFileAsync(dockerPath, args, { encoding: "utf8", maxBuffer: 4 * 1024 * 1024 });
+  return stdout.trim();
+}
+
+integration("Docker adapter applies hard isolation settings and cleans up after worker failure", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "pocket-docker-sandbox-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  await writeFile(join(root, "input.txt"), "assigned content\n");
+
+  const runner = new DockerSandboxRunner({ dockerPath, image: image!, allowUnpinnedImageForTests: true });
+  const job = await runner.create({
+    id: `integration-${process.pid}`,
+    workspacePath: root,
+    conversationId: "test",
+    deadlineAt: new Date(Date.now() + 30_000),
+    outputLimitBytes: 64 * 1024,
+    events: { status: async () => {} },
+  });
+  t.after(() => job.dispose());
+
+  const containerId = await docker("ps", "--all", "--quiet", "--filter", `label=pocket-agent.job-id=${job.id}`);
+  assert.ok(containerId);
+  const inspected = JSON.parse(await docker("inspect", containerId))[0];
+  assert.equal(inspected.Config.User, "65532:65532");
+  assert.equal(inspected.HostConfig.ReadonlyRootfs, true);
+  assert.equal(inspected.HostConfig.NetworkMode, "none");
+  assert.deepEqual(inspected.HostConfig.CapDrop, ["ALL"]);
+  assert.ok(inspected.HostConfig.SecurityOpt.includes("no-new-privileges=true"));
+  assert.equal(inspected.HostConfig.PidsLimit, 256);
+  assert.equal(inspected.HostConfig.Memory, 1024 * 1024 * 1024);
+  assert.equal(inspected.HostConfig.NanoCpus, 1_000_000_000);
+  assert.equal(inspected.HostConfig.LogConfig.Type, "none");
+  assert.equal(Object.keys(inspected.NetworkSettings.Ports ?? {}).length, 0);
+  assert.match(inspected.HostConfig.Tmpfs["/tmp"], /size=268435456/);
+  assert.equal(inspected.Mounts.length, 1);
+  assert.equal(inspected.Mounts[0].Destination, "/workspace");
+  assert.equal(inspected.Mounts[0].Type, "volume");
+  const inspectedVolume = JSON.parse(await docker("volume", "inspect", inspected.Mounts[0].Name))[0];
+  assert.equal(inspectedVolume.Options.type, "tmpfs");
+  assert.match(inspectedVolume.Options.o, /size=805306368/);
+
+  await assert.rejects(job.start("do nothing"), (error: unknown) =>
+    error instanceof SandboxFailure && error.code === "internal_error",
+  );
+  assert.equal(await readFile(join(root, "input.txt"), "utf8"), "assigned content\n");
+
+  const volume = inspected.Mounts[0].Name as string;
+  await job.dispose();
+  await assert.rejects(docker("inspect", containerId));
+  await assert.rejects(docker("volume", "inspect", volume));
+});
+
+integration("Docker adapter exports workspace changes and preserves turns", async (t) => {
+  if (!fixtureImage) return t.skip("fixture image is not configured");
+  const root = await mkdtemp(join(tmpdir(), "pocket-docker-export-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  await writeFile(join(root, "input.txt"), "baseline\n");
+  const runner = new DockerSandboxRunner({ dockerPath, image: fixtureImage, allowUnpinnedImageForTests: true });
+  const statuses: string[] = [];
+  const job = await runner.create({
+    id: `export-${process.pid}`,
+    workspacePath: root,
+    conversationId: "test",
+    deadlineAt: new Date(Date.now() + 30_000),
+    outputLimitBytes: 64 * 1024,
+    events: { status: async (message) => { statuses.push(message); } },
+  });
+  t.after(() => job.dispose());
+
+  assert.equal(await job.start("first"), "completed first");
+  assert.equal(await readFile(join(root, "worker.txt"), "utf8"), "first\n");
+  assert.equal(await job.start("second"), "completed second");
+  assert.equal(await readFile(join(root, "worker.txt"), "utf8"), "first\nsecond\n");
+  const steered = job.start("hang");
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  await job.steer("continue");
+  assert.equal(await steered, "completed after steer");
+  assert.deepEqual(statuses, ["steered"]);
+});
+
+integration("Docker adapter bounds deadlines and reports worker crashes", async (t) => {
+  if (!fixtureImage) return t.skip("fixture image is not configured");
+  const root = await mkdtemp(join(tmpdir(), "pocket-docker-limits-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const runner = new DockerSandboxRunner({ dockerPath, image: fixtureImage, allowUnpinnedImageForTests: true });
+
+  const crashing = await runner.create({
+    id: `crash-${process.pid}`,
+    workspacePath: root,
+    conversationId: "test",
+    deadlineAt: new Date(Date.now() + 30_000),
+    outputLimitBytes: 64 * 1024,
+    events: { status: async () => {} },
+  });
+  await assert.rejects(crashing.start("crash"), (error: unknown) =>
+    error instanceof SandboxFailure && error.code === "worker_crash",
+  );
+  await crashing.dispose();
+
+  const hanging = await runner.create({
+    id: `timeout-${process.pid}`,
+    workspacePath: root,
+    conversationId: "test",
+    deadlineAt: new Date(Date.now() + 1_000),
+    outputLimitBytes: 64 * 1024,
+    events: { status: async () => {} },
+  });
+  await assert.rejects(hanging.start("hang"), (error: unknown) =>
+    error instanceof SandboxFailure && error.code === "deadline_exceeded",
+  );
+  await hanging.dispose();
+
+  const cancelled = await runner.create({
+    id: `cancel-${process.pid}`,
+    workspacePath: root,
+    conversationId: "test",
+    deadlineAt: new Date(Date.now() + 30_000),
+    outputLimitBytes: 64 * 1024,
+    events: { status: async () => {} },
+  });
+  const cancellation = assert.rejects(cancelled.start("hang"), /cancelled/);
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  await cancelled.cancel();
+  await cancellation;
+  assert.equal(await docker("ps", "--all", "--quiet", "--filter", `label=pocket-agent.job-id=${cancelled.id}`), "");
+});
+
+integration("Docker kernel limits contain process and memory pressure", async (t) => {
+  if (!fixtureImage) return t.skip("fixture image is not configured");
+  const root = await mkdtemp(join(tmpdir(), "pocket-docker-pressure-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const runner = new DockerSandboxRunner({
+    dockerPath,
+    image: fixtureImage,
+    allowUnpinnedImageForTests: true,
+    limits: { pids: 32, memoryBytes: 134_217_728 },
+  });
+
+  const forked = await runner.create({
+    id: `fork-${process.pid}`,
+    workspacePath: root,
+    conversationId: "test",
+    deadlineAt: new Date(Date.now() + 30_000),
+    outputLimitBytes: 64 * 1024,
+    events: { status: async () => {} },
+  });
+  await assert.rejects(forked.start("fork-pressure"), (error: unknown) =>
+    error instanceof SandboxFailure && error.code === "worker_crash",
+  );
+  await forked.dispose();
+
+  const pressured = await runner.create({
+    id: `memory-${process.pid}`,
+    workspacePath: root,
+    conversationId: "test",
+    deadlineAt: new Date(Date.now() + 30_000),
+    outputLimitBytes: 64 * 1024,
+    events: { status: async () => {} },
+  });
+  await assert.rejects(pressured.start("memory-pressure"), (error: unknown) =>
+    error instanceof SandboxFailure && error.code === "worker_crash",
+  );
+  await pressured.dispose();
+});
+
+integration("Docker reconciliation removes labeled orphan containers and volumes", async () => {
+  const runner = new DockerSandboxRunner({ dockerPath, image: image!, allowUnpinnedImageForTests: true });
+  const suffix = `${process.pid}-${Date.now()}`;
+  const volume = `pocket-agent-integration-orphan-${suffix}`;
+  const container = `pocket-agent-integration-orphan-${suffix}`;
+  await docker("volume", "create", "--label", "pocket-agent.managed=true", volume);
+  await docker(
+    "create", "--name", container,
+    "--label", "pocket-agent.managed=true",
+    "--mount", `type=volume,src=${volume},dst=/workspace`,
+    image!, "--smoke-test",
+  );
+
+  await runner.reconcile();
+  await assert.rejects(docker("inspect", container));
+  await assert.rejects(docker("volume", "inspect", volume));
+});
