@@ -74,6 +74,10 @@ The deep seams are intentionally small:
 - Docker (recommended for `signal-cli` and MCP isolation)
 - A Signal account. Linking `signal-cli` as a secondary device is recommended.
 
+## The worker image
+
+The pinned, multi-platform worker image packages Pi and baseline build tools under numeric UID/GID `65532`. Its restrictive protocol entrypoint runs with a read-only root filesystem and contains no credentials or container client. See [`docs/worker-image.md`](docs/worker-image.md) for builds, hardened smoke tests, SBOM inspection, and the update procedure. Pi execution remains fail-closed in this image until issue #5 moves execution out of the host process.
+
 ## The Signal image
 
 The repository builds its own image from [`docker/signal-cli/Dockerfile`](docker/signal-cli/Dockerfile). It does **not** download or run `signal-cli-rest-api`.

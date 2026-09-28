@@ -1,0 +1,62 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.19.0
+          cache: npm
+      - run: npm ci
+      - run: npm run check
+
+  worker-image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - name: Build supported worker platforms
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/worker/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: false
+          build-args: IMAGE_REVISION=${{ github.sha }}
+      - name: Load worker image for smoke tests
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/worker/Dockerfile
+          platforms: linux/amd64
+          load: true
+          tags: pocket-agent/worker:test
+          build-args: IMAGE_REVISION=${{ github.sha }}
+      - name: Smoke test hardened runtime
+        run: |
+          set -euo pipefail
+          output="$(docker run --rm \
+            --read-only \
+            --tmpfs /tmp:rw,nosuid,nodev,noexec,size=16m \
+            --network none \
+            --cap-drop ALL \
+            --security-opt no-new-privileges \
+            --pids-limit 64 \
+            pocket-agent/worker:test --smoke-test)"
+          node -e 'const value=JSON.parse(process.argv[1]); if (!value.ok || value.uid !== 65532 || value.gid !== 65532 || value.piVersion !== "0.87.1") process.exit(1)' "$output"
+
+          if printf 'not-json\n' | docker run --rm -i --read-only --tmpfs /tmp:rw,nosuid,nodev,noexec,size=16m --network none pocket-agent/worker:test; then
+            echo "worker accepted malformed input" >&2
+            exit 1
+          fi

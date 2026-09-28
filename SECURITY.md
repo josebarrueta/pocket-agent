@@ -25,6 +25,10 @@ The separate `link-helper` image includes Debian, a shell, and `qrencode` for on
 
 The daemon requires outbound network access to Signal and persistent write access to `signal-cli-data`. All other filesystem content is read-only, capabilities are dropped, and inbound access is loopback-only. Do not loosen these controls without reviewing the consequence.
 
+## Worker image provenance
+
+The worker image uses a digest-pinned multi-platform Node base, an immutable Debian package snapshot, and a separate integrity-locked npm dependency tree. It runs as numeric UID/GID `65532`; its intended runtime has a read-only root filesystem, dropped capabilities, no network by default, and writable storage only for bounded temporary data and the disposable workspace. The image contains no Docker client/socket, host checkout, configuration, or credentials. Review changes to any image, package, or snapshot pin as security-sensitive. See [`docs/worker-image.md`](docs/worker-image.md).
+
 ## Secrets and logs
 
 Protect `config.json`, Pi's credential directory, `signal-cli-data`, and the configured state directory with owner-only permissions. Tool arguments may be sent to Signal for approval and may contain sensitive data. The application does not intentionally log message bodies, but upstream processes may log diagnostics.
