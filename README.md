@@ -10,60 +10,44 @@ From Signal you can report a bug, start a Pi task in an allowlisted repository, 
 
 Signal works for a private, self-hosted workflow through the unofficial `signal-cli` daemon and does not need a public webhook. WhatsApp support fits the same `Messenger` interface, but its official Cloud API requires business setup, a public webhook, and template handling outside the 24-hour customer-service window. See [`docs/research.md`](docs/research.md).
 
-## Architecture
+## Target architecture
 
 ```mermaid
 flowchart LR
-    operator["Operator<br/>Signal app"]
-    signal["Signal service"]
+    phone["Operator<br/>Signal app"] <-->|"encrypted messages"| signal["Signal service"]
 
-    subgraph host["Developer machine"]
-        direction LR
+    subgraph trusted["Trusted host"]
+        signalcli["signal-cli<br/>hardened container"]
+        controller["Control plane<br/>jobs, approvals, cancel"]
+        manager["Sandbox manager"]
+        gateway["MCP capability broker<br/>policy and audit"]
+        model["Model proxy<br/>provider credentials"]
+        repos[("Host repositories")]
+        connectors["Credentialed connectors"]
 
-        subgraph container["Hardened Signal containers"]
-            daemon["signal-cli daemon<br/>minimal scratch image"]
-            linker["One-off link helper<br/>stopped after setup"]
-            keys[("Linked-device keys")]
-            linker -.->|writes once| keys
-            daemon <--> keys
-        end
-
-        subgraph control["Pocket Agent host process"]
-            adapter["SignalMessenger<br/>transport adapter"]
-            controller["Controller<br/>commands and job lifecycle"]
-            approvals["ApprovalPort<br/>ask / allow / deny"]
-            sessions[("Session state")]
-            policy["Host configuration<br/>sender, repo, and tool policy"]
-
-            adapter <--> controller
-            controller <--> sessions
-            controller <--> approvals
-            policy -.->|allowlists and defaults| controller
-            policy -.->|permission rules| approvals
-        end
-
-        subgraph execution["Agent execution"]
-            pi["Pi SDK session<br/>AgentRun"]
-            tools["Built-in tools<br/>read / write / bash"]
-            gateway["MCP gateway<br/>deny by default"]
-            repos[("Allowlisted repositories")]
-            mcp["Approved MCP servers<br/>local stdio or isolated container"]
-
-            pi --> tools --> repos
-            pi --> gateway --> mcp
-        end
-
-        daemon <-->|"SSE events / JSON-RPC sends<br/>127.0.0.1:8080 only"| adapter
-        controller <-->|"start, steer, cancel, progress"| pi
-        approvals -.->|tool decisions| pi
-        approvals -.->|tool decisions| gateway
+        signalcli <-->|"loopback only"| controller
+        controller --> manager
+        controller <--> gateway
+        gateway --> repos
+        gateway --> connectors
     end
 
-    operator <-->|"end-to-end encrypted messages"| signal
-    signal <-->|"Signal protocol<br/>outbound network only"| daemon
+    subgraph sandbox["Untrusted disposable job sandbox"]
+        pi["Pi agent runtime"]
+        shell["Shell and build tools"]
+        workspace[("Workspace copy")]
+        pi --> shell --> workspace
+    end
+
+    signal <--> signalcli
+    manager -->|"create, steer, kill"| pi
+    pi -->|"authenticated MCP only"| gateway
+    pi -->|"private endpoint"| model
 ```
 
-Commands arrive through the SSE stream; replies and progress use JSON-RPC in the reverse direction. The Signal daemon is isolated from agent execution and exposes its API only on host loopback. The controller accepts only configured senders and repository aliases, while Pi tool calls and MCP calls pass through explicit policy and approval points before reaching local resources.
+Arbitrary agent-selected commands run only inside a disposable worker. The worker receives a repository copy, not the original host checkout, and has no host home directory, Docker socket, or long-lived credentials. Privileged actions cross an authenticated MCP seam where the trusted capability broker validates job identity, scope, normalized arguments, policy, and operator approval. The broker exposes typed capabilities and never a generic host shell.
+
+**Current MVP gap:** Pi still runs in the host process, so approvals are not an isolation boundary. The diagram is the target design for the next implementation phase. See [`docs/architecture.md`](docs/architecture.md) for security invariants, request flow, module interfaces, and the migration plan.
 
 The deep seams are intentionally small:
 
