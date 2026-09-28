@@ -10,6 +10,7 @@ import {
   type SandboxProtocolVersion,
   type WorkerToHostMessage,
 } from "./sandbox-protocol.js";
+import type { CapabilityLease, CapabilityLeaseIssuer } from "./capability-broker.js";
 import { SandboxFailure, type JobSandboxSpec, type SandboxJob, type SandboxRunner } from "./sandbox.js";
 
 const execFileAsync = promisify(execFile);
@@ -33,6 +34,8 @@ export interface DockerSandboxRunnerOptions {
   model?: string;
   thinking?: string;
   permissions?: { read: "allow" | "ask" | "deny"; write: "allow" | "ask" | "deny"; bash: "allow" | "ask" | "deny" };
+  capabilityLeases?: CapabilityLeaseIssuer;
+  allowedCapabilities?: readonly string[];
   protocolHandshakeMs?: number;
   commandTimeoutMs?: number;
   limits?: Partial<DockerSandboxLimits>;
@@ -56,6 +59,8 @@ export class DockerSandboxRunner implements SandboxRunner {
   private readonly model: string | undefined;
   private readonly thinking: string | undefined;
   private readonly permissions: DockerSandboxRunnerOptions["permissions"];
+  private readonly capabilityLeases: CapabilityLeaseIssuer | undefined;
+  private readonly allowedCapabilities: readonly string[];
   private readonly handshakeMs: number;
   private readonly commandTimeoutMs: number;
   private readonly limits: DockerSandboxLimits;
@@ -73,6 +78,8 @@ export class DockerSandboxRunner implements SandboxRunner {
     this.model = options.model;
     this.thinking = options.thinking;
     this.permissions = options.permissions;
+    this.capabilityLeases = options.capabilityLeases;
+    this.allowedCapabilities = options.allowedCapabilities ?? [];
     this.handshakeMs = options.protocolHandshakeMs ?? 5_000;
     this.commandTimeoutMs = options.commandTimeoutMs ?? 30_000;
     this.limits = { ...DEFAULT_LIMITS, ...options.limits };
@@ -89,6 +96,7 @@ export class DockerSandboxRunner implements SandboxRunner {
     const suffix = randomUUID().slice(0, 8);
     const containerName = `pocket-agent-job-${spec.id}-${suffix}`;
     const volumeName = `pocket-agent-workspace-${spec.id}-${suffix}`;
+    let capabilityLease: CapabilityLease | undefined;
     await this.docker([
       "volume", "create",
       "--label", MANAGED_LABEL,
@@ -101,6 +109,15 @@ export class DockerSandboxRunner implements SandboxRunner {
     ]);
 
     try {
+      if (this.capabilityLeases) {
+        capabilityLease = this.capabilityLeases.issue({
+          jobId: spec.id,
+          conversationId: spec.conversationId,
+          repositoryScope: spec.repositoryScope,
+          allowedTools: this.allowedCapabilities,
+          expiresAt: spec.deadlineAt,
+        });
+      }
       await this.importWorkspace(spec.workspacePath, volumeName, `${containerName}-import`);
       await this.docker([
         "create", "--interactive",
@@ -126,9 +143,16 @@ export class DockerSandboxRunner implements SandboxRunner {
         ...(this.model ? ["--env", `POCKET_AGENT_MODEL=${this.model}`] : []),
         ...(this.thinking ? ["--env", `POCKET_AGENT_THINKING=${this.thinking}`] : []),
         ...(this.permissions ? ["--env", `POCKET_AGENT_PERMISSIONS=${JSON.stringify(this.permissions)}`] : []),
+        ...(capabilityLease ? [
+          "--mount", `type=bind,src=${capabilityLease.socketDirectory},dst=/run/pocket-agent-broker,readonly`,
+          "--env", `POCKET_AGENT_MCP_SOCKET=/run/pocket-agent-broker/${basename(capabilityLease.socketPath)}`,
+          "--env", `POCKET_AGENT_MCP_CREDENTIAL=${capabilityLease.credential}`,
+          "--env", `POCKET_AGENT_JOB_ID=${spec.id}`,
+        ] : []),
         this.image,
       ]);
     } catch (error) {
+      capabilityLease?.revoke();
       await this.dockerIgnoringFailure(["rm", "--force", containerName]);
       await this.dockerIgnoringFailure(["volume", "rm", "--force", volumeName]);
       throw error;
@@ -143,6 +167,7 @@ export class DockerSandboxRunner implements SandboxRunner {
       volumeName,
       this.handshakeMs,
       this.commandTimeoutMs,
+      capabilityLease,
     );
   }
 
@@ -235,6 +260,7 @@ class DockerSandboxJob implements SandboxJob {
     readonly volumeName: string,
     private readonly handshakeMs: number,
     private readonly commandTimeoutMs: number,
+    private readonly capabilityLease?: CapabilityLease,
   ) {}
 
   get id(): string { return this.spec.id; }
@@ -593,6 +619,7 @@ class DockerSandboxJob implements SandboxJob {
   }
 
   private disposeResources(): Promise<void> {
+    this.capabilityLease?.revoke();
     if (this.cleanup) return this.cleanup;
     this.cleanup = (async () => {
       await dockerIgnoringFailure(this.dockerPath, ["rm", "--force", this.containerName], this.commandTimeoutMs);

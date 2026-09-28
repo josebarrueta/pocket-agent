@@ -22,6 +22,13 @@ export interface ApprovalRequest {
   title: string;
   detail: string;
   choices?: readonly string[];
+  /** Immutable authorization binding for one broker operation. */
+  operation?: {
+    tool: string;
+    argumentDigest: string;
+    expiresAt: string;
+    nonce: string;
+  };
 }
 
 export interface ApprovalPort {

@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process";
 import { appendFile, readFile } from "node:fs/promises";
+import { request as httpRequest } from "node:http";
 import { createInterface } from "node:readline";
 
 const send = (message) => process.stdout.write(`${JSON.stringify(message)}\n`);
@@ -52,6 +53,33 @@ for await (const line of lines) {
     const allocations = [];
     setInterval(() => allocations.push(Buffer.alloc(16 * 1024 * 1024, 1)), 5);
     continue;
+  }
+  if (message.prompt === "broker-list") {
+    const body = JSON.stringify({
+      jsonrpc: "2.0",
+      id: 1,
+      method: "tools/list",
+      params: { _meta: { "pocket-agent/job-id": process.env.POCKET_AGENT_JOB_ID } },
+    });
+    const brokerResult = await new Promise((resolve, reject) => {
+      const request = httpRequest({
+        socketPath: process.env.POCKET_AGENT_MCP_SOCKET,
+        path: "/mcp",
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${process.env.POCKET_AGENT_MCP_CREDENTIAL}`,
+          "content-type": "application/json",
+          "content-length": Buffer.byteLength(body),
+        },
+      }, (response) => {
+        const chunks = [];
+        response.on("data", (chunk) => chunks.push(chunk));
+        response.on("end", () => resolve(JSON.parse(Buffer.concat(chunks).toString("utf8"))));
+      });
+      request.once("error", reject);
+      request.end(body);
+    });
+    await appendFile("/workspace/broker.json", JSON.stringify(brokerResult));
   }
   if (message.prompt.startsWith("probe-isolation:")) {
     const hostPath = message.prompt.slice("probe-isolation:".length);

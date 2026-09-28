@@ -1,12 +1,14 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { promisify } from "node:util";
+import { CapabilityBroker, type CapabilityLeaseRequest } from "../src/capability-broker.js";
 import { DockerSandboxRunner } from "../src/docker-sandbox.js";
 import { SandboxFailure } from "../src/sandbox.js";
+import type { ApprovalPort } from "../src/types.js";
 
 const execFileAsync = promisify(execFile);
 const image = process.env.POCKET_AGENT_DOCKER_TEST_IMAGE;
@@ -29,6 +31,7 @@ integration("Docker adapter applies hard isolation settings and cleans up after 
     id: `integration-${process.pid}`,
     workspacePath: root,
     conversationId: "test",
+    repositoryScope: "repo",
     deadlineAt: new Date(Date.now() + 30_000),
     outputLimitBytes: 64 * 1024,
     events: { status: async () => {} },
@@ -79,6 +82,7 @@ integration("Docker adapter exports workspace changes and preserves turns", asyn
     id: `export-${process.pid}`,
     workspacePath: root,
     conversationId: "test",
+    repositoryScope: "repo",
     deadlineAt: new Date(Date.now() + 30_000),
     outputLimitBytes: 64 * 1024,
     events: {
@@ -102,6 +106,66 @@ integration("Docker adapter exports workspace changes and preserves turns", asyn
   assert.equal(await readFile(join(root, "approval.txt"), "utf8"), "yes\n");
 });
 
+integration("job worker reaches only its authenticated capability scope over private transport", async (t) => {
+  if (!fixtureImage) return t.skip("fixture image is not configured");
+  if (process.platform === "darwin") return t.skip("Docker Desktop cannot forward host Unix sockets through its VM");
+  const root = await mkdtemp(join(tmpdir(), "pocket-docker-broker-"));
+  const workspace = join(root, "workspace");
+  await mkdir(workspace);
+  const approvals: ApprovalPort = { request: async () => "no", answer: () => false, cancelScope: () => {} };
+  const broker = new CapabilityBroker({
+    socketPath: join(root, "transport", "mcp.sock"),
+    auditPath: join(root, "audit.ndjson"),
+    approvals,
+    tools: [{
+      name: "workspace.read_metadata",
+      description: "Read metadata",
+      inputSchema: { type: "object" },
+      policy: "allow",
+      normalize: () => ({}),
+      invoke: async () => ({}),
+    }],
+  });
+  await broker.start();
+  let issuedCredential = "";
+  const leases = {
+    issue(request: CapabilityLeaseRequest) {
+      const granted = broker.issue(request);
+      issuedCredential = granted.credential;
+      return granted;
+    },
+  };
+  t.after(async () => { await broker.close(); await rm(root, { recursive: true, force: true }); });
+  const runner = new DockerSandboxRunner({
+    dockerPath,
+    image: fixtureImage,
+    allowUnpinnedImageForTests: true,
+    capabilityLeases: leases,
+    allowedCapabilities: ["workspace.read_metadata"],
+  });
+  const job = await runner.create({
+    id: `broker-${process.pid}`,
+    workspacePath: workspace,
+    conversationId: "test",
+    repositoryScope: "repo",
+    deadlineAt: new Date(Date.now() + 30_000),
+    outputLimitBytes: 64 * 1024,
+    events: { status: async () => {} },
+  });
+  const containerId = await docker("ps", "--all", "--quiet", "--filter", `label=pocket-agent.job-id=${job.id}`);
+  const inspected = JSON.parse(await docker("inspect", containerId))[0];
+  assert.equal(inspected.HostConfig.NetworkMode, "none");
+  const brokerMount = inspected.Mounts.find((mount: { Destination: string }) => mount.Destination === "/run/pocket-agent-broker");
+  assert.equal(brokerMount.Type, "bind");
+  assert.equal(brokerMount.RW, false);
+
+  assert.equal(await job.start("broker-list"), "turn:broker-list");
+  const response = JSON.parse(await readFile(join(workspace, "broker.json"), "utf8"));
+  assert.deepEqual(response.result.tools.map((tool: { name: string }) => tool.name), ["workspace.read_metadata"]);
+  await job.dispose();
+  await assert.rejects(broker.list(issuedCredential, job.id), /revoked/);
+});
+
 integration("sandboxed test tool cannot read host files, environment secrets, or Docker socket", async (t) => {
   if (!fixtureImage) return t.skip("fixture image is not configured");
   const workspace = await mkdtemp(join(tmpdir(), "pocket-docker-isolation-"));
@@ -123,6 +187,7 @@ integration("sandboxed test tool cannot read host files, environment secrets, or
     id: `isolation-${process.pid}`,
     workspacePath: workspace,
     conversationId: "test",
+    repositoryScope: "repo",
     deadlineAt: new Date(Date.now() + 30_000),
     outputLimitBytes: 64 * 1024,
     events: { status: async () => {} },
@@ -146,6 +211,7 @@ integration("Docker adapter bounds deadlines and reports worker crashes", async 
     id: `crash-${process.pid}`,
     workspacePath: root,
     conversationId: "test",
+    repositoryScope: "repo",
     deadlineAt: new Date(Date.now() + 30_000),
     outputLimitBytes: 64 * 1024,
     events: { status: async () => {} },
@@ -159,6 +225,7 @@ integration("Docker adapter bounds deadlines and reports worker crashes", async 
     id: `timeout-${process.pid}`,
     workspacePath: root,
     conversationId: "test",
+    repositoryScope: "repo",
     deadlineAt: new Date(Date.now() + 1_000),
     outputLimitBytes: 64 * 1024,
     events: { status: async () => {} },
@@ -172,6 +239,7 @@ integration("Docker adapter bounds deadlines and reports worker crashes", async 
     id: `cancel-${process.pid}`,
     workspacePath: root,
     conversationId: "test",
+    repositoryScope: "repo",
     deadlineAt: new Date(Date.now() + 30_000),
     outputLimitBytes: 64 * 1024,
     events: { status: async () => {} },
@@ -198,6 +266,7 @@ integration("Docker kernel limits contain process and memory pressure", async (t
     id: `fork-${process.pid}`,
     workspacePath: root,
     conversationId: "test",
+    repositoryScope: "repo",
     deadlineAt: new Date(Date.now() + 30_000),
     outputLimitBytes: 64 * 1024,
     events: { status: async () => {} },
@@ -211,6 +280,7 @@ integration("Docker kernel limits contain process and memory pressure", async (t
     id: `memory-${process.pid}`,
     workspacePath: root,
     conversationId: "test",
+    repositoryScope: "repo",
     deadlineAt: new Date(Date.now() + 30_000),
     outputLimitBytes: 64 * 1024,
     events: { status: async () => {} },

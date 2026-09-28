@@ -9,6 +9,7 @@ function spec(overrides: Partial<JobSandboxSpec> = {}): JobSandboxSpec {
     id: "job-1",
     workspacePath: "/work/app",
     conversationId: "operator",
+    repositoryScope: "repo",
     deadlineAt: new Date(Date.now() + 10_000),
     outputLimitBytes: 1_000,
     events: { status: async () => {} },

@@ -10,13 +10,13 @@ Pocket Agent connects a remote message to coding tools that can read files, modi
 - Jobs are scoped to the conversation that created them.
 - Pi and all built-in filesystem/shell tools execute only in a constrained disposable worker.
 - Writes and shell commands require approval by default; approvals are not the isolation seam.
-- Workers have no network or MCP access until the scoped brokers are implemented.
+- Workers have no network access; native Linux workers receive only a short-lived authenticated MCP lease over a private Unix socket. No production capabilities are registered yet.
 
 ## Important limitations
 
 Approvals are not isolation. An allowed shell command can perform any action available inside its worker, and an agent may be prompt-injected by repository content. Docker isolation depends on the host kernel/VM and daemon configuration. Signal transport security does not protect a compromised host or unlocked phone. `signal-cli` is unofficial and stores linked-device keys locally.
 
-The worker currently receives no provider credentials and has no network, so model-backed jobs remain unavailable until the model proxy is implemented. Keep secrets out of repositories and the daemon environment, enable backups, review every approval and candidate patch, and pin worker image digests. Never publish the Signal daemon port; the supplied compose file binds it to loopback.
+The worker currently receives no provider credentials and has no network, so model-backed jobs remain unavailable until the model proxy is implemented. Capability transport currently requires native Linux Docker; Docker Desktop for macOS cannot forward the host Unix socket and access fails closed. Keep secrets out of repositories and the daemon environment, enable backups, review every approval and candidate patch, and pin worker image digests. Never publish the Signal daemon port; the supplied compose file binds it to loopback.
 
 ## Signal image provenance
 

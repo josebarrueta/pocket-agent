@@ -81,9 +81,13 @@ interface JobSandboxSpec {
   id: string;
   workspacePath: string;
   conversationId: string;
+  repositoryScope: string;
   deadlineAt: Date;
   outputLimitBytes: number;
-  events: { status(message: string): Promise<void> };
+  events: {
+    status(message: string): Promise<void>;
+    approval?(request: SandboxApprovalRequest): Promise<string>;
+  };
 }
 
 interface SandboxJob {
@@ -106,9 +110,9 @@ The capability broker exposes curated MCP tools such as:
 - `github.create_pull_request`
 - `secrets.perform_operation`
 
-Each call is evaluated server-side against the authenticated job identity, repository scope, normalized arguments, configured policy, rate and output limits, and any required operator approval. Configuration is loaded by the trusted host and cannot be modified through Signal or by the worker.
+Each call is evaluated server-side against the authenticated job identity, repository scope, normalized arguments, configured policy, call and output limits, and any required operator approval. Configuration is loaded by the trusted host and cannot be modified through Signal or by the worker. The authenticated transport, lease lifecycle, audit format, and Linux platform constraint are documented in [`capability-broker.md`](capability-broker.md).
 
-Approvals should authorize one normalized operation, not a tool forever. An approval record should bind the job ID, tool name, arguments or argument digest, expiry, and a one-time nonce. Cancellation revokes outstanding approvals and the job's broker lease.
+Approvals authorize one normalized operation, not a tool forever. An approval record binds the job ID, tool name, canonical argument digest, lease expiry, and a one-time request nonce. The broker re-authenticates after the answer, so cancellation or expiry wins approval races. Cancellation revokes outstanding approvals and the job's broker lease.
 
 ### Workspace adapter
 
@@ -153,7 +157,7 @@ MCP is the mediation protocol, not the isolation mechanism. The sandbox provides
 
 Pi, its built-in read/write/bash tools, and its in-memory session now run only inside the Docker worker. The host package no longer installs Pi or exposes a host-side agent/MCP adapter. Workers receive only a disposable workspace, safe model-selection metadata, and normalized approval responses; they receive no host environment or credentials.
 
-The remaining gap is connectivity: the worker currently has `network=none`, while the authenticated capability broker and credential-free model proxy are still pending. Until those modules are complete, production workers cannot reach MCP capabilities or model providers. Approvals reduce accidental tool use inside the disposable workspace; sandbox isolation—not approval—is the security seam.
+The host now exposes an authenticated, job-scoped MCP broker over a private Unix socket mounted read-only into native Linux workers. No production capabilities are registered yet; issue #7 adds workspace tools. The credential-free model proxy is also pending, so production workers still cannot reach model providers. Docker Desktop for macOS cannot forward the host Unix socket and fails capability access closed. Approvals reduce accidental tool use inside the disposable workspace; sandbox isolation—not approval—is the security seam.
 
 ## Recommended migration order
 

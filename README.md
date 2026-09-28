@@ -4,7 +4,7 @@ A private Signal control plane for a coding agent running on your machine.
 
 From Signal you can report a bug, start a Pi task in an allowlisted repository, receive progress and final output, answer questions/permission prompts, steer active work, cancel it, and switch between sessions. MCP tools are exposed through a deny-by-default gateway.
 
-> **Early MVP:** use on a development machine with backups. Pi and its built-in tools now run only in a constrained disposable Docker worker. The capability broker and model proxy are still under construction, so the isolated production path cannot yet access models or MCP capabilities.
+> **Early MVP:** use on a development machine with backups. Pi and its built-in tools run only in a constrained disposable Docker worker. The authenticated capability broker is present but has no production tools until issue #7; the model proxy is still under construction.
 
 ## Why Signal first?
 
@@ -47,7 +47,7 @@ flowchart LR
 
 Arbitrary agent-selected commands run only inside a disposable worker. The worker receives a repository copy, not the original host checkout, and has no host home directory, Docker socket, or long-lived credentials. Privileged actions cross an authenticated MCP seam where the trusted capability broker validates job identity, scope, normalized arguments, policy, and operator approval. The broker exposes typed capabilities and never a generic host shell.
 
-Pi execution and built-in tools now run in the isolated worker; the host package does not install or initialize Pi. The authenticated capability broker and credential-free model proxy remain target work. See [`docs/architecture.md`](docs/architecture.md) for security invariants, request flow, module interfaces, and the migration plan.
+Pi execution and built-in tools run in the isolated worker; the host package does not install or initialize Pi. The host now issues short-lived, job-scoped broker leases over a private Unix-socket transport with normalized policy checks, one-operation approvals, limits, revocation, and redacted audit records. Curated capabilities and the credential-free model proxy remain target work. See [`docs/architecture.md`](docs/architecture.md) and [`docs/capability-broker.md`](docs/capability-broker.md).
 
 The deep seams are intentionally small:
 
@@ -178,11 +178,11 @@ docker inspect pocket-agent/signal-cli:0.13.20
 
 ## Capability safety model
 
-The old host-side MCP extension was removed with host-side Pi. MCP servers are executable programs, not passive tool descriptions, so workers will reach privileged operations only through the authenticated, scoped capability broker tracked by issue #6. Until that broker and the model proxy exist, Docker workers have `network=none` and receive no host or provider credentials.
+The old host-side MCP extension was removed with host-side Pi. MCP servers are executable programs, not passive tool descriptions, so workers reach privileged operations only through the authenticated, scoped capability broker. The broker currently registers no production capabilities; issue #7 adds curated workspace operations. Docker workers retain `network=none` and receive no host or provider credentials. Native Linux Docker supports the private Unix-socket mount; Docker Desktop for macOS fails capability access closed because its VM cannot forward host Unix sockets.
 
 ## Deliberate MVP limits / roadmap
 
-1. Add the authenticated MCP capability broker and workspace capabilities.
+1. Add curated workspace capabilities to the authenticated MCP broker.
 2. Add the job-scoped model proxy so isolated Pi sessions can reach configured models without provider credentials.
 3. Add crash-safe controller job metadata restoration; worker Pi sessions are intentionally in-memory today.
 4. Add adversarial end-to-end isolation tests and an official WhatsApp adapter.

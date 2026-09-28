@@ -83,6 +83,7 @@ export class Controller {
 
   async close(): Promise<void> {
     await Promise.allSettled([...this.jobs.values()].map(async (job) => {
+      this.approvals.cancelScope(job.conversationId, job.id);
       try {
         await job.run.cancel();
       } finally {
@@ -118,6 +119,7 @@ export class Controller {
         id,
         workspacePath: workspace.path,
         conversationId,
+        repositoryScope: repo,
         deadlineAt: new Date(Date.now() + (this.options.jobTimeoutMs ?? DEFAULT_JOB_TIMEOUT_MS)),
         outputLimitBytes: this.options.outputLimitBytes ?? DEFAULT_OUTPUT_LIMIT_BYTES,
         events: {

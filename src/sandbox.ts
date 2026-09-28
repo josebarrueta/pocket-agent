@@ -18,6 +18,8 @@ export interface JobSandboxSpec {
   /** Trusted host path resolved from a configured repository alias. */
   workspacePath: string;
   conversationId: ConversationId;
+  /** Configured repository alias; never a host path. */
+  repositoryScope: string;
   /** Absolute deadline for the lifetime of this job. */
   deadlineAt: Date;
   /** Maximum UTF-8 bytes accepted in a completion message. */
