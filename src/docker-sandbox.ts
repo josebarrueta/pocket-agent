@@ -30,6 +30,9 @@ export interface DockerSandboxRunnerOptions {
   dockerPath: string;
   tarPath?: string;
   image: string;
+  model?: string;
+  thinking?: string;
+  permissions?: { read: "allow" | "ask" | "deny"; write: "allow" | "ask" | "deny"; bash: "allow" | "ask" | "deny" };
   protocolHandshakeMs?: number;
   commandTimeoutMs?: number;
   limits?: Partial<DockerSandboxLimits>;
@@ -50,6 +53,9 @@ export class DockerSandboxRunner implements SandboxRunner {
   private readonly dockerPath: string;
   private readonly tarPath: string;
   private readonly image: string;
+  private readonly model: string | undefined;
+  private readonly thinking: string | undefined;
+  private readonly permissions: DockerSandboxRunnerOptions["permissions"];
   private readonly handshakeMs: number;
   private readonly commandTimeoutMs: number;
   private readonly limits: DockerSandboxLimits;
@@ -64,6 +70,9 @@ export class DockerSandboxRunner implements SandboxRunner {
     }
     this.dockerPath = options.dockerPath;
     this.image = options.image;
+    this.model = options.model;
+    this.thinking = options.thinking;
+    this.permissions = options.permissions;
     this.handshakeMs = options.protocolHandshakeMs ?? 5_000;
     this.commandTimeoutMs = options.commandTimeoutMs ?? 30_000;
     this.limits = { ...DEFAULT_LIMITS, ...options.limits };
@@ -114,6 +123,9 @@ export class DockerSandboxRunner implements SandboxRunner {
         "--mount", `type=volume,src=${volumeName},dst=/workspace`,
         "--stop-timeout", "1",
         "--log-driver", "none",
+        ...(this.model ? ["--env", `POCKET_AGENT_MODEL=${this.model}`] : []),
+        ...(this.thinking ? ["--env", `POCKET_AGENT_THINKING=${this.thinking}`] : []),
+        ...(this.permissions ? ["--env", `POCKET_AGENT_PERMISSIONS=${JSON.stringify(this.permissions)}`] : []),
         this.image,
       ]);
     } catch (error) {
@@ -276,6 +288,11 @@ class DockerSandboxJob implements SandboxJob {
   async cancel(): Promise<void> {
     if (this.cancelled || this.disposed) return;
     this.cancelled = true;
+    if (this.handshake && !this.protocolVersion) {
+      clearTimeout(this.handshake.timer);
+      this.handshake.reject(new Error("Sandbox job cancelled"));
+      delete this.handshake;
+    }
     const run = this.active;
     if (run && !run.terminal && this.child && this.protocolVersion) {
       try {
@@ -295,6 +312,11 @@ class DockerSandboxJob implements SandboxJob {
   async dispose(): Promise<void> {
     if (this.disposed) return this.cleanup;
     this.disposed = true;
+    if (this.handshake && !this.protocolVersion) {
+      clearTimeout(this.handshake.timer);
+      this.handshake.reject(new Error("Sandbox job disposed"));
+      delete this.handshake;
+    }
     const run = this.active;
     if (run && !run.terminal) this.finish(run, new Error("Sandbox job disposed"));
     await this.disposeResources();
@@ -399,6 +421,8 @@ class DockerSandboxJob implements SandboxJob {
     if (!run || run.terminal || message.runId !== run.id) return;
     if (message.type === "status") {
       void this.spec.events.status(message.message).catch(() => {});
+    } else if (message.type === "approval_request") {
+      void this.answerApproval(run, message);
     } else if (message.type === "completion") {
       if (Buffer.byteLength(message.output, "utf8") > this.spec.outputLimitBytes) {
         this.finish(run, new SandboxFailure("Worker output exceeded its byte limit", "output_limit_exceeded", false));
@@ -408,6 +432,34 @@ class DockerSandboxJob implements SandboxJob {
     } else {
       this.finish(run, new SandboxFailure(message.message, message.code, message.retryable));
     }
+  }
+
+  private async answerApproval(
+    run: ActiveRun,
+    message: Extract<WorkerToHostMessage, { type: "approval_request" }>,
+  ): Promise<void> {
+    let answer = "no";
+    try {
+      if (this.spec.events.approval) {
+        answer = await this.spec.events.approval({
+          kind: message.kind,
+          title: message.title,
+          detail: message.detail,
+          ...(message.choices ? { choices: message.choices } : {}),
+        });
+      }
+    } catch { /* cancelled approvals default to denial */ }
+    if (run.terminal || this.cancelled || this.disposed) return;
+    try {
+      await this.send({
+        protocolVersion: this.protocolVersion!,
+        type: "approval_response",
+        jobId: this.id,
+        runId: run.id,
+        requestId: message.requestId,
+        answer,
+      });
+    } catch { /* worker exit is handled by process supervision */ }
   }
 
   private onExit(code: number | null, spawnError?: Error): void {
@@ -560,6 +612,12 @@ function isWorkerMessage(value: Record<string, unknown>, version: SandboxProtoco
   }
   if (value.type === "completion") {
     return hasOnlyKeys(value, ["protocolVersion", "type", "jobId", "runId", "output"]) && typeof value.output === "string";
+  }
+  if (value.type === "approval_request") {
+    return hasOnlyKeys(value, ["protocolVersion", "type", "jobId", "runId", "requestId", "kind", "title", "detail", "choices"]) &&
+      typeof value.requestId === "string" && ["question", "agent-tool"].includes(String(value.kind)) &&
+      typeof value.title === "string" && typeof value.detail === "string" &&
+      (value.choices === undefined || Array.isArray(value.choices) && value.choices.every((choice) => typeof choice === "string"));
   }
   if (value.type === "failure") {
     return hasOnlyKeys(value, ["protocolVersion", "type", "jobId", "runId", "code", "message", "retryable"]) &&

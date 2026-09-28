@@ -10,7 +10,7 @@
   },
   "stateDir": "~/.local/share/pocket-agent",
   "sandbox": {
-    "runner": "in-process",
+    "runner": "docker",
     "dockerPath": "/usr/local/bin/docker",
     "image": "pocket-agent/worker@sha256:PIN_THE_BUILT_IMAGE_DIGEST",
     "cpus": 1,
@@ -26,21 +26,6 @@
       "read": "allow",
       "write": "ask",
       "bash": "ask"
-    }
-  },
-  "mcpServers": {
-    "example-readonly": {
-      "command": "/usr/local/bin/docker",
-      "args": [
-        "run", "--rm", "-i", "--network=none", "--read-only",
-        "example/mcp-server@sha256:PIN_THE_IMAGE_DIGEST"
-      ],
-      "env": {},
-      "defaultToolDecision": "deny",
-      "tools": {
-        "search": "ask"
-      },
-      "timeoutMs": 30000
     }
   }
 }

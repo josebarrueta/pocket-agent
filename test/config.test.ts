@@ -5,9 +5,11 @@ import { join } from "node:path";
 import test from "node:test";
 import { loadConfig } from "../src/config.js";
 
+const pinnedImage = `worker@sha256:${"a".repeat(64)}`;
 const base = {
   signal: { account: "+15550000000", allowedSenders: ["+15550000001"] },
   repositories: { app: "/work/app" },
+  sandbox: { runner: "docker", dockerPath: "/usr/bin/docker", image: pinnedImage },
 };
 
 async function withConfig(value: unknown, run: (path: string) => Promise<void>): Promise<void> {
@@ -21,11 +23,15 @@ async function withConfig(value: unknown, run: (path: string) => Promise<void>):
   }
 }
 
-test("sandbox defaults preserve the transitional in-process runner", async () => {
+test("production configuration requires the Docker sandbox", async () => {
   await withConfig(base, async (path) => {
     const config = await loadConfig(path);
-    assert.equal(config.sandbox.runner, "in-process");
+    assert.equal(config.sandbox.runner, "docker");
     assert.equal(config.sandbox.pids, 256);
+  });
+  const { sandbox: _sandbox, ...withoutSandbox } = base;
+  await withConfig(withoutSandbox, async (path) => {
+    await assert.rejects(loadConfig(path), /sandbox/);
   });
 });
 

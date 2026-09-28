@@ -23,7 +23,7 @@ Build and publish the worker image from [`worker-image.md`](worker-image.md), th
 
 The Docker executable path must be absolute and the configured image must use a `sha256` digest. The daemon reconciles labeled containers and volumes from a previous run before accepting messages. Run only one controller against a Docker daemon because reconciliation intentionally removes every resource carrying the `pocket-agent.managed=true` label.
 
-The current worker image negotiates the protocol but fails closed before running Pi. Issue #5 enables Pi execution; until then, keep `runner` set to `in-process` for functional jobs.
+Docker is the only production runner. The host forwards only configured model/thinking identifiers and tool policy; it does not forward provider credentials or its ambient environment. Model traffic remains unavailable until the job-scoped proxy from issue #8 is connected through a private network.
 
 ## Effective controls
 

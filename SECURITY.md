@@ -8,14 +8,15 @@ Pocket Agent connects a remote message to coding tools that can read files, modi
 - Signal group messages are ignored.
 - Repository paths and MCP processes are configured locally, never through chat.
 - Jobs are scoped to the conversation that created them.
-- Writes and shell commands require approval by default.
-- MCP tools are denied unless explicitly listed or covered by a non-deny server policy.
+- Pi and all built-in filesystem/shell tools execute only in a constrained disposable worker.
+- Writes and shell commands require approval by default; approvals are not the isolation seam.
+- Workers have no network or MCP access until the scoped brokers are implemented.
 
 ## Important limitations
 
-Approvals are not isolation. An allowed shell command can evade later checks, an agent may be prompt-injected by repository content, and an MCP process can act during startup. Signal transport security does not protect a compromised host or unlocked phone. `signal-cli` is unofficial and stores linked-device keys locally.
+Approvals are not isolation. An allowed shell command can perform any action available inside its worker, and an agent may be prompt-injected by repository content. Docker isolation depends on the host kernel/VM and daemon configuration. Signal transport security does not protect a compromised host or unlocked phone. `signal-cli` is unofficial and stores linked-device keys locally.
 
-Use a dedicated OS account or container/VM, mount only required repositories, keep secrets out of the environment, restrict egress, enable backups, and review every approval. Pin dependencies and MCP container image digests. Never publish the Signal daemon port; the supplied compose file binds it to loopback.
+The worker currently receives no provider credentials and has no network, so model-backed jobs remain unavailable until the model proxy is implemented. Keep secrets out of repositories and the daemon environment, enable backups, review every approval and candidate patch, and pin worker image digests. Never publish the Signal daemon port; the supplied compose file binds it to loopback.
 
 ## Signal image provenance
 
@@ -35,7 +36,7 @@ The worker image uses a digest-pinned multi-platform Node base, an immutable Deb
 
 ## Secrets and logs
 
-Protect `config.json`, Pi's credential directory, `signal-cli-data`, and the configured state directory with owner-only permissions. Tool arguments may be sent to Signal for approval and may contain sensitive data. The application does not intentionally log message bodies, but upstream processes may log diagnostics.
+Protect `config.json`, `signal-cli-data`, and the configured state directory with owner-only permissions. Tool arguments may be sent to Signal for approval and may contain sensitive data. Pi settings and sessions are in-memory inside each worker; no host Pi credential directory is mounted. The application does not intentionally log message bodies, but upstream processes may log diagnostics.
 
 ## Reporting
 

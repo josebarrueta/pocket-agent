@@ -2,7 +2,7 @@
 
 `docker/worker/Dockerfile` builds the disposable job runtime for `linux/amd64` and `linux/arm64`. It contains Node.js, Pi, the protocol entrypoint, and an explicit baseline toolset: Bash, CA certificates, Git, GNU C/C++ and Make, Patch, Python 3, and ripgrep. It does not install a Docker/Podman client or copy configuration, credentials, repository content, or the host application into the image.
 
-The image currently fails closed after protocol negotiation because moving Pi execution from the host into this entrypoint is tracked separately in issue #5.
+The entrypoint owns an in-memory Pi session and explicitly enables built-in `read`, `bash`, `edit`, and `write` tools rooted at `/workspace`. It disables project/global extensions, skills, prompt templates, and themes; emits bounded tool status; and implements start, steer, cancel, completion, failure, and approval messages. No Pi package or built-in execution tool is installed in the host application.
 
 ## Build and smoke test
 
@@ -27,7 +27,7 @@ docker run --rm \
   pocket-agent/worker:test --smoke-test
 ```
 
-The smoke result must report UID/GID `65532`, Pi `0.87.1`, and protocol version `1`. The normal entrypoint accepts bounded newline-delimited JSON on standard input. It rejects malformed messages, unknown fields, unsupported versions, and command-line overrides.
+The smoke result must report UID/GID `65532`, Pi `0.87.1`, and protocol version `1`. The normal entrypoint accepts bounded newline-delimited JSON on standard input. It rejects malformed messages, unknown fields, unsupported versions, and command-line overrides. Session/settings state is in memory; only files written beneath the job workspace survive long enough to become a candidate patch.
 
 ## Provenance and inspection
 

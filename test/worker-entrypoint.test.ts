@@ -4,13 +4,13 @@ import { resolve } from "node:path";
 import test from "node:test";
 
 const entrypoint = resolve("docker/worker/worker.mjs");
-const piBinary = resolve("node_modules/.bin/pi");
+const piBinary = resolve("test/fixtures/fake-pi");
 
 function run(input = "", args: string[] = []) {
   return spawnSync(process.execPath, [entrypoint, ...args], {
     encoding: "utf8",
     input,
-    env: { ...process.env, PI_BINARY: piBinary },
+    env: { ...process.env, PI_BINARY: piBinary, POCKET_AGENT_DISABLE_MODEL: "1" },
     timeout: 15_000,
   });
 }
@@ -24,7 +24,7 @@ test("worker smoke test verifies Pi and reports its identity", () => {
   assert.deepEqual(output.protocolVersions, [1]);
 });
 
-test("worker negotiates v1 and fails closed until Pi execution is wired", () => {
+test("worker negotiates v1 and reports bounded Pi initialization failures", () => {
   const input = [
     JSON.stringify({ type: "hello", supportedVersions: [1] }),
     JSON.stringify({

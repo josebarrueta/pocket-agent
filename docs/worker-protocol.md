@@ -15,6 +15,7 @@ Version 1 messages also contain a host-generated `jobId` and `runId`. `jobId` is
 - `start`: prompt, absolute ISO-8601 `deadlineAt`, and maximum UTF-8 `outputLimitBytes` for the completion.
 - `steer`: additional input for the active run.
 - `cancel`: termination request with reason `operator`, `deadline`, or `dispose`.
+- `approval_response`: one answer bound to the active run and a worker-generated request ID.
 
 The worker must treat the deadline and output limit as hard limits. The host adapter independently enforces them and must forcibly terminate a worker that does not honor cancellation.
 
@@ -23,6 +24,7 @@ The worker must treat the deadline and output limit as hard limits. The host ada
 - `status`: non-terminal progress text.
 - `completion`: terminal output for a successful run.
 - `failure`: terminal error with a stable `code`, human-readable `message`, and `retryable` flag. Version 1 codes are `worker_crash`, `deadline_exceeded`, `output_limit_exceeded`, and `internal_error`.
+- `approval_request`: a bounded question or tool approval with title, detail, choices, and one request ID. The host scopes it to the job/conversation and returns exactly one response.
 
 ## Lifecycle invariants
 

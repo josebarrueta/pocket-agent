@@ -4,7 +4,7 @@ A private Signal control plane for a coding agent running on your machine.
 
 From Signal you can report a bug, start a Pi task in an allowlisted repository, receive progress and final output, answer questions/permission prompts, steer active work, cancel it, and switch between sessions. MCP tools are exposed through a deny-by-default gateway.
 
-> **Early MVP:** use on a development machine with backups. Coding agents and MCP servers can execute code with the daemon user's privileges. Chat approvals reduce accidents; they do not provide process isolation.
+> **Early MVP:** use on a development machine with backups. Pi and its built-in tools now run only in a constrained disposable Docker worker. The capability broker and model proxy are still under construction, so the isolated production path cannot yet access models or MCP capabilities.
 
 ## Why Signal first?
 
@@ -47,12 +47,12 @@ flowchart LR
 
 Arbitrary agent-selected commands run only inside a disposable worker. The worker receives a repository copy, not the original host checkout, and has no host home directory, Docker socket, or long-lived credentials. Privileged actions cross an authenticated MCP seam where the trusted capability broker validates job identity, scope, normalized arguments, policy, and operator approval. The broker exposes typed capabilities and never a generic host shell.
 
-**Current MVP gap:** Pi still runs in the host process, so approvals are not an isolation boundary. The diagram is the target design for the next implementation phase. See [`docs/architecture.md`](docs/architecture.md) for security invariants, request flow, module interfaces, and the migration plan.
+Pi execution and built-in tools now run in the isolated worker; the host package does not install or initialize Pi. The authenticated capability broker and credential-free model proxy remain target work. See [`docs/architecture.md`](docs/architecture.md) for security invariants, request flow, module interfaces, and the migration plan.
 
 The deep seams are intentionally small:
 
 - `Messenger`: incoming messages and outbound text. A WhatsApp adapter can replace Signal.
-- `SandboxRunner` / `SandboxJob`: create, start, steer, cancel and dispose isolated jobs. The current in-process Pi adapter is transitional; Docker and VM adapters fit the same seam.
+- `SandboxRunner` / `SandboxJob`: create, start, steer, cancel and dispose isolated jobs. Docker is the production adapter; VM adapters can fit the same seam.
 - `ApprovalPort`: turns blocking agent questions and tool permissions into chat requests.
 
 ## Current capabilities
@@ -65,19 +65,19 @@ The deep seams are intentionally small:
 - Incoming senders and repositories are host-configured allowlists.
 - Jobs use bounded disposable repository snapshots; candidate patches are exported with a changed-file manifest while the original checkout remains untouched.
 - Pi writes and shell calls default to explicit approval.
-- MCP uses local stdio only, absolute executables, no shell, deny-by-default tool policy, timeouts and output limits.
+- The prior host-side MCP extension has been removed; privileged capabilities will return through the authenticated broker.
 - Signal group messages are ignored in the MVP; only allowlisted private senders are accepted.
 
 ## Prerequisites
 
 - Node.js 20.12+
-- Pi credentials already configured (`pi /login` or provider API environment variables)
+- A digest-pinned Pocket Agent worker image built from this repository
 - Docker (recommended for `signal-cli` and MCP isolation)
 - A Signal account. Linking `signal-cli` as a secondary device is recommended.
 
 ## The worker image
 
-The pinned, multi-platform worker image packages Pi and baseline build tools under numeric UID/GID `65532`. Its restrictive protocol entrypoint runs with a read-only root filesystem and contains no credentials or container client. See [`docs/worker-image.md`](docs/worker-image.md) for builds, hardened smoke tests, SBOM inspection, and the update procedure. The [`DockerSandboxRunner`](docs/docker-sandbox.md) adds per-job resource, filesystem, network, lifecycle, and cleanup controls. Pi execution remains fail-closed in this image until issue #5 moves execution out of the host process.
+The pinned, multi-platform worker image packages Pi and baseline build tools under numeric UID/GID `65532`. Its protocol entrypoint owns the in-memory Pi session, built-in tools, steering, cancellation, status, and tool approvals. It runs with a read-only root filesystem and contains no credentials or container client. See [`docs/worker-image.md`](docs/worker-image.md) for builds, hardened smoke tests, SBOM inspection, and the update procedure. The [`DockerSandboxRunner`](docs/docker-sandbox.md) adds per-job resource, filesystem, network, lifecycle, and cleanup controls.
 
 ## The Signal image
 
@@ -123,13 +123,21 @@ On Apple Silicon, Compose runs the upstream x86-64 native release under Docker's
 
 Keep `signal-cli-data` private and backed up securely; it contains linked-device cryptographic material. Do not run `signal-link` while the daemon is running because both processes would contend for the same account database.
 
+Build the worker and copy its local digest into `sandbox.image`:
+
+```bash
+docker buildx build --load --file docker/worker/Dockerfile --tag pocket-agent/worker:0.1.0 .
+docker image inspect pocket-agent/worker:0.1.0 --format '{{index .RepoDigests 0}}'
+```
+
 Edit `config.json`:
 
 - `account`: the linked Signal account in international format.
 - `allowedSenders`: exact trusted sender number(s) or UUID(s). Pairing is never performed over chat.
 - `repositories`: chat-safe aliases mapped to absolute local paths.
-- `agent.model`: optional `provider/model-id`; omit it to use Pi's configured default.
-- `permissions`: `allow`, `ask`, or `deny` for reads, writes, and shell calls.
+- `sandbox.image`: the complete digest-pinned worker image reference from the build.
+- `agent.model`: optional `provider/model-id`; model access will use the job-scoped proxy added in issue #8.
+- `permissions`: `allow`, `ask`, or `deny` for reads, writes, and shell calls inside the worker.
 
 Then:
 
@@ -168,25 +176,17 @@ docker image history --no-trunc pocket-agent/signal-cli:0.13.20
 docker inspect pocket-agent/signal-cli:0.13.20
 ```
 
-## MCP safety model
+## Capability safety model
 
-MCP servers are executable programs, not passive tool descriptions. A malicious server can act as soon as it starts. For that reason:
-
-- MCP config is read only at daemon startup and cannot be changed from Signal.
-- Commands must be absolute paths and are spawned directly, without a shell.
-- Every server defaults to denying every tool.
-- Tool calls can require an operator approval showing their arguments.
-- Project and global Pi extensions are disabled for hosted sessions.
-
-For untrusted MCP servers, configure the executable as the absolute Docker/Podman path and use a pinned image digest, `--network=none`, `--read-only`, a non-root user, resource limits, no host secrets, and only narrowly scoped read-only mounts. The example config shows the shape. Do the same for the **agent daemon itself** if you require a hard security boundary.
+The old host-side MCP extension was removed with host-side Pi. MCP servers are executable programs, not passive tool descriptions, so workers will reach privileged operations only through the authenticated, scoped capability broker tracked by issue #6. Until that broker and the model proxy exist, Docker workers have `network=none` and receive no host or provider credentials.
 
 ## Deliberate MVP limits / roadmap
 
-1. Add crash-safe job metadata restoration (Pi transcripts are already persisted, controller job selection is not).
-2. Add an official WhatsApp Cloud API adapter with signature verification and webhook deduplication.
-3. Add ACP-backed agent adapters for Claude Code, Codex and other clients.
-4. Add a first-class container runner for both agents and MCP servers.
-5. Add attachments, git worktrees, schedules, and richer progress summaries.
+1. Add the authenticated MCP capability broker and workspace capabilities.
+2. Add the job-scoped model proxy so isolated Pi sessions can reach configured models without provider credentials.
+3. Add crash-safe controller job metadata restoration; worker Pi sessions are intentionally in-memory today.
+4. Add adversarial end-to-end isolation tests and an official WhatsApp adapter.
+5. Add attachments, schedules, and richer progress summaries.
 
 ## Development
 

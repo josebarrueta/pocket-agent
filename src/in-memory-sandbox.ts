@@ -107,6 +107,25 @@ export class InMemorySandboxJob implements SandboxJob {
       await this.spec.events.status(message.message);
       return true;
     }
+    if (message.type === "approval_request") {
+      const answer = this.spec.events.approval
+        ? await this.spec.events.approval({
+            kind: message.kind,
+            title: message.title,
+            detail: message.detail,
+            ...(message.choices ? { choices: message.choices } : {}),
+          })
+        : "no";
+      this.commands.push({
+        protocolVersion: this.protocolVersion,
+        type: "approval_response",
+        jobId: this.id,
+        runId: run.id,
+        requestId: message.requestId,
+        answer,
+      });
+      return true;
+    }
     if (message.type === "completion") {
       if (Buffer.byteLength(message.output, "utf8") > this.spec.outputLimitBytes) {
         this.finish(run, new SandboxFailure("Worker output exceeded its byte limit", "output_limit_exceeded", false));

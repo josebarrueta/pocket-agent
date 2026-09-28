@@ -3,7 +3,7 @@ import test from "node:test";
 import { Controller } from "../src/controller.js";
 import { InMemorySandboxRunner } from "../src/in-memory-sandbox.js";
 import type { StartMessage } from "../src/sandbox-protocol.js";
-import type { ApprovalPort, IncomingMessage, Messenger } from "../src/types.js";
+import type { ApprovalPort, ApprovalRequest, IncomingMessage, Messenger } from "../src/types.js";
 import type { JobWorkspace, WorkspacePatch, WorkspaceProvider } from "../src/workspace.js";
 
 class FakeMessenger implements Messenger {
@@ -15,7 +15,11 @@ class FakeMessenger implements Messenger {
 
 class FakeApprovals implements ApprovalPort {
   answerResult = false;
-  async request(): Promise<string> { return "yes"; }
+  requests: Array<{ conversationId: string; request: ApprovalRequest }> = [];
+  async request(conversationId: string, request: ApprovalRequest): Promise<string> {
+    this.requests.push({ conversationId, request });
+    return "yes";
+  }
   answer(): boolean { return this.answerResult; }
   cancelScope(): void {}
 }
@@ -77,6 +81,39 @@ test("starts a job only in an operator-configured repository", async () => {
 
   await controller.handle(message("/new unknown do something"));
   assert.match(messenger.sent.at(-1)?.text ?? "", /Unknown repo/);
+});
+
+test("routes worker approvals through the conversation-scoped approval broker", async () => {
+  const approvals = new FakeApprovals();
+  const runner = new InMemorySandboxRunner();
+  const controller = new Controller(new FakeMessenger(), approvals, runner, new FakeWorkspaces());
+
+  await controller.handle(message("/new app task"));
+  const start = firstStart(runner);
+  await runner.jobs[0]!.receive({
+    protocolVersion: 1,
+    type: "approval_request",
+    jobId: start.jobId,
+    runId: start.runId,
+    requestId: "worker-request",
+    kind: "agent-tool",
+    title: "Allow bash?",
+    detail: "npm test",
+    choices: ["yes", "no"],
+  });
+
+  assert.deepEqual(approvals.requests, [{
+    conversationId: "operator",
+    request: {
+      kind: "agent-tool",
+      scopeId: start.jobId,
+      title: "Allow bash?",
+      detail: "npm test",
+      choices: ["yes", "no"],
+    },
+  }]);
+  assert.equal(runner.jobs[0]?.commands.at(-1)?.type, "approval_response");
+  await controller.close();
 });
 
 test("bug command adds a reproduce, fix, and test instruction", async () => {

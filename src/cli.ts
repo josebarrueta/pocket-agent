@@ -4,7 +4,6 @@ import { MessageApprovalBroker } from "./approvals.js";
 import { loadConfig } from "./config.js";
 import { Controller } from "./controller.js";
 import { DockerSandboxRunner } from "./docker-sandbox.js";
-import { PiSandboxRunner } from "./pi-agent.js";
 import { SignalMessenger } from "./signal.js";
 import { DisposableWorkspaceManager } from "./workspace.js";
 
@@ -17,20 +16,21 @@ async function main(): Promise<void> {
     config.signal.allowedSenders,
   );
   const approvals = new MessageApprovalBroker(messenger);
-  const sandboxes = config.sandbox.runner === "docker"
-    ? new DockerSandboxRunner({
-        dockerPath: config.sandbox.dockerPath,
-        image: config.sandbox.image!,
-        limits: {
-          cpus: config.sandbox.cpus,
-          memoryBytes: config.sandbox.memoryBytes,
-          pids: config.sandbox.pids,
-          temporaryStorageBytes: config.sandbox.temporaryStorageBytes,
-          workspaceStorageBytes: config.sandbox.workspaceStorageBytes,
-        },
-      })
-    : new PiSandboxRunner(config, approvals);
-  if (sandboxes instanceof DockerSandboxRunner) await sandboxes.reconcile();
+  const sandboxes = new DockerSandboxRunner({
+    dockerPath: config.sandbox.dockerPath,
+    image: config.sandbox.image,
+    ...(config.agent.model ? { model: config.agent.model } : {}),
+    thinking: config.agent.thinking,
+    permissions: config.agent.permissions,
+    limits: {
+      cpus: config.sandbox.cpus,
+      memoryBytes: config.sandbox.memoryBytes,
+      pids: config.sandbox.pids,
+      temporaryStorageBytes: config.sandbox.temporaryStorageBytes,
+      workspaceStorageBytes: config.sandbox.workspaceStorageBytes,
+    },
+  });
+  await sandboxes.reconcile();
   const workspaces = new DisposableWorkspaceManager(join(config.stateDir, "workspaces"), config.repositories);
   await workspaces.reclaimStale(new Date());
   const controller = new Controller(messenger, approvals, sandboxes, workspaces);

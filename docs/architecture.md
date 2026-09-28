@@ -151,9 +151,9 @@ MCP is the mediation protocol, not the isolation mechanism. The sandbox provides
 
 ## Current implementation gap
 
-The current MVP runs the Pi SDK in the Pocket Agent host process. Pi's built-in read, write, and shell tools therefore execute with the daemon user's host privileges after policy or approval checks. The existing MCP gateway constrains configured MCP servers, but it does not isolate Pi itself.
+Pi, its built-in read/write/bash tools, and its in-memory session now run only inside the Docker worker. The host package no longer installs Pi or exposes a host-side agent/MCP adapter. Workers receive only a disposable workspace, safe model-selection metadata, and normalized approval responses; they receive no host environment or credentials.
 
-Moving to this target architecture requires replacing the transitional in-process `PiSandboxRunner` adapter with an isolated sandbox adapter, disabling host-side built-in execution, and moving privileged interactions behind the capability broker. Until that work is complete, approvals must not be treated as a security boundary.
+The remaining gap is connectivity: the worker currently has `network=none`, while the authenticated capability broker and credential-free model proxy are still pending. Until those modules are complete, production workers cannot reach MCP capabilities or model providers. Approvals reduce accidental tool use inside the disposable workspace; sandbox isolation—not approval—is the security seam.
 
 ## Recommended migration order
 

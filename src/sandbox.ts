@@ -1,7 +1,15 @@
 import type { ConversationId } from "./types.js";
 
+export interface SandboxApprovalRequest {
+  kind: "question" | "agent-tool";
+  title: string;
+  detail: string;
+  choices?: readonly string[];
+}
+
 export interface SandboxEvents {
   status(message: string): Promise<void>;
+  approval?(request: SandboxApprovalRequest): Promise<string>;
 }
 
 export interface JobSandboxSpec {

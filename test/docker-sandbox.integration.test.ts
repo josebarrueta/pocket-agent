@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { promisify } from "node:util";
@@ -74,13 +74,17 @@ integration("Docker adapter exports workspace changes and preserves turns", asyn
   await writeFile(join(root, "input.txt"), "baseline\n");
   const runner = new DockerSandboxRunner({ dockerPath, image: fixtureImage, allowUnpinnedImageForTests: true });
   const statuses: string[] = [];
+  const approvals: string[] = [];
   const job = await runner.create({
     id: `export-${process.pid}`,
     workspacePath: root,
     conversationId: "test",
     deadlineAt: new Date(Date.now() + 30_000),
     outputLimitBytes: 64 * 1024,
-    events: { status: async (message) => { statuses.push(message); } },
+    events: {
+      status: async (message) => { statuses.push(message); },
+      approval: async (request) => { approvals.push(request.title); return "yes"; },
+    },
   });
   t.after(() => job.dispose());
 
@@ -93,6 +97,43 @@ integration("Docker adapter exports workspace changes and preserves turns", asyn
   await job.steer("continue");
   assert.equal(await steered, "completed after steer");
   assert.deepEqual(statuses, ["steered"]);
+  assert.equal(await job.start("approval"), "approval handled");
+  assert.deepEqual(approvals, ["Allow test tool?"]);
+  assert.equal(await readFile(join(root, "approval.txt"), "utf8"), "yes\n");
+});
+
+integration("sandboxed test tool cannot read host files, environment secrets, or Docker socket", async (t) => {
+  if (!fixtureImage) return t.skip("fixture image is not configured");
+  const workspace = await mkdtemp(join(tmpdir(), "pocket-docker-isolation-"));
+  const hostSecretPath = join(homedir(), `.pocket-agent-host-secret-${process.pid}-${Date.now()}`);
+  await writeFile(hostSecretPath, "host-only\n", { mode: 0o600 });
+  t.after(() => Promise.all([
+    rm(workspace, { recursive: true, force: true }),
+    rm(hostSecretPath, { force: true }),
+  ]));
+  const previousSecret = process.env.POCKET_AGENT_HOST_TEST_SECRET;
+  process.env.POCKET_AGENT_HOST_TEST_SECRET = "must-not-enter-worker";
+  t.after(() => {
+    if (previousSecret === undefined) delete process.env.POCKET_AGENT_HOST_TEST_SECRET;
+    else process.env.POCKET_AGENT_HOST_TEST_SECRET = previousSecret;
+  });
+
+  const runner = new DockerSandboxRunner({ dockerPath, image: fixtureImage, allowUnpinnedImageForTests: true });
+  const job = await runner.create({
+    id: `isolation-${process.pid}`,
+    workspacePath: workspace,
+    conversationId: "test",
+    deadlineAt: new Date(Date.now() + 30_000),
+    outputLimitBytes: 64 * 1024,
+    events: { status: async () => {} },
+  });
+  t.after(() => job.dispose());
+  await job.start(`probe-isolation:${hostSecretPath}`);
+  assert.deepEqual(JSON.parse(await readFile(join(workspace, "isolation.json"), "utf8")), {
+    inheritedSecret: null,
+    hostFileAccessible: false,
+    dockerSocketAccessible: false,
+  });
 });
 
 integration("Docker adapter bounds deadlines and reports worker crashes", async (t) => {

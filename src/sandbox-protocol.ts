@@ -34,7 +34,13 @@ export interface CancelMessage extends HostMessageBase {
   reason: "operator" | "deadline" | "dispose";
 }
 
-export type HostToWorkerMessage = StartMessage | SteerMessage | CancelMessage;
+export interface ApprovalResponseMessage extends HostMessageBase {
+  type: "approval_response";
+  requestId: string;
+  answer: string;
+}
+
+export type HostToWorkerMessage = StartMessage | SteerMessage | CancelMessage | ApprovalResponseMessage;
 
 interface WorkerMessageBase {
   protocolVersion: SandboxProtocolVersion;
@@ -52,6 +58,15 @@ export interface CompletionMessage extends WorkerMessageBase {
   output: string;
 }
 
+export interface WorkerApprovalRequestMessage extends WorkerMessageBase {
+  type: "approval_request";
+  requestId: string;
+  kind: "question" | "agent-tool";
+  title: string;
+  detail: string;
+  choices?: readonly string[];
+}
+
 export interface FailureMessage extends WorkerMessageBase {
   type: "failure";
   code: "worker_crash" | "deadline_exceeded" | "output_limit_exceeded" | "internal_error";
@@ -59,7 +74,7 @@ export interface FailureMessage extends WorkerMessageBase {
   retryable: boolean;
 }
 
-export type WorkerToHostMessage = StatusMessage | CompletionMessage | FailureMessage;
+export type WorkerToHostMessage = StatusMessage | CompletionMessage | FailureMessage | WorkerApprovalRequestMessage;
 
 /** Selects the highest mutually supported protocol version. */
 export function negotiateProtocolVersion(workerVersions: readonly number[]): SandboxProtocolVersion {

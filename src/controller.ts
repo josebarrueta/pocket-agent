@@ -120,7 +120,13 @@ export class Controller {
         conversationId,
         deadlineAt: new Date(Date.now() + (this.options.jobTimeoutMs ?? DEFAULT_JOB_TIMEOUT_MS)),
         outputLimitBytes: this.options.outputLimitBytes ?? DEFAULT_OUTPUT_LIMIT_BYTES,
-        events: { status: (text) => this.messenger.send(conversationId, `[${id}] ${text}`) },
+        events: {
+          status: (text) => this.messenger.send(conversationId, `[${id}] ${text}`),
+          approval: (request) => this.approvals.request(conversationId, {
+            ...request,
+            scopeId: id,
+          }),
+        },
       });
     } catch (error) {
       await workspace.dispose();
