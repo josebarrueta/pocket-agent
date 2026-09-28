@@ -470,11 +470,13 @@ class DockerSandboxJob implements SandboxJob {
     } else if (message.type === "completion") {
       if (Buffer.byteLength(message.output, "utf8") > this.spec.outputLimitBytes) {
         this.finish(run, new SandboxFailure("Worker output exceeded its byte limit", "output_limit_exceeded", false));
+        void this.disposeResources();
       } else {
         this.finishWithWorkspaceExport(run, message.output);
       }
     } else {
       this.finish(run, new SandboxFailure(message.message, message.code, message.retryable));
+      void this.disposeResources();
     }
   }
 
@@ -517,6 +519,7 @@ class DockerSandboxJob implements SandboxJob {
     }
     const run = this.active;
     if (run && !run.terminal) this.finish(run, error);
+    void this.disposeResources();
   }
 
   private async protocolViolation(error: Error): Promise<void> {

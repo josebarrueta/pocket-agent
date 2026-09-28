@@ -44,6 +44,6 @@ The local-driver `tmpfs` volume requires a Linux Docker daemon, including Docker
 
 ## Lifecycle
 
-The adapter negotiates protocol v1, rejects malformed or oversized messages, ignores stale terminal events, and maps unexpected container exit to `worker_crash`. Deadline and operator cancellation force-remove the container, which kills its complete process tree. Disposal then force-removes both container and volume and is idempotent.
+The adapter negotiates protocol v1, rejects malformed or oversized messages, ignores stale terminal events, and maps unexpected container exit to `worker_crash`. Worker-reported failures, process exit, output-limit failure, deadline, and operator cancellation revoke both leases and force-remove the container and volume through one idempotent cleanup path. Force removal kills the complete process tree even when a malicious worker ignores cancellation.
 
-CI builds the worker for amd64 and arm64, inspects effective container settings, exercises multi-turn workspace export, simulates worker crash and timeout, and verifies orphan reconciliation. Fork and memory pressure are bounded by the same inspected kernel-enforced PID and memory settings.
+CI builds the worker for amd64 and arm64, inspects effective container settings, exercises multi-turn workspace export, actively probes host and internet isolation, simulates failures and resource pressure, and verifies orphan reconciliation. Fork, memory, disk, and output pressure are bounded by inspected kernel/runtime controls. See the complete [`isolation-verification.md`](isolation-verification.md) matrix.

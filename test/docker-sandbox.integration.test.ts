@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
+import { createServer } from "node:http";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
@@ -20,6 +21,14 @@ const integration = image ? test : test.skip;
 async function docker(...args: string[]): Promise<string> {
   const { stdout } = await execFileAsync(dockerPath, args, { encoding: "utf8", maxBuffer: 4 * 1024 * 1024 });
   return stdout.trim();
+}
+
+async function waitForMissingDockerObject(name: string): Promise<void> {
+  for (let attempt = 0; attempt < 40; attempt += 1) {
+    try { await docker("inspect", name); } catch { return; }
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  assert.fail(`Docker object ${name} was not reclaimed`);
 }
 
 integration("Docker adapter applies hard isolation settings and cleans up after worker failure", async (t) => {
@@ -66,9 +75,9 @@ integration("Docker adapter applies hard isolation settings and cleans up after 
   assert.equal(await readFile(join(root, "input.txt"), "utf8"), "assigned content\n");
 
   const volume = inspected.Mounts[0].Name as string;
-  await job.dispose();
-  await assert.rejects(docker("inspect", containerId));
+  await waitForMissingDockerObject(containerId);
   await assert.rejects(docker("volume", "inspect", volume));
+  await job.dispose();
 });
 
 integration("Docker adapter exports workspace changes and preserves turns", async (t) => {
@@ -183,6 +192,9 @@ integration("job worker reaches only its authenticated capability scope over pri
     events: { status: async () => {} },
   });
   await assert.rejects(realWorker.start("initialize capabilities"), /No model is available inside the worker/);
+  await assert.rejects(broker.list(issuedCredential, realWorker.id), /revoked/);
+  const failedContainer = await docker("ps", "--all", "--quiet", "--filter", `label=pocket-agent.job-id=${realWorker.id}`);
+  if (failedContainer) await waitForMissingDockerObject(failedContainer);
   await realWorker.dispose();
 });
 
@@ -249,20 +261,41 @@ integration("real worker streams through the job model proxy without provider cr
   assert.equal(await job.start("respond through proxy"), "proxy works");
 });
 
-integration("sandboxed test tool cannot read host files, environment secrets, or Docker socket", async (t) => {
+integration("malicious worker cannot reach host files, secrets, ports, internet, or Docker", async (t) => {
   if (!fixtureImage) return t.skip("fixture image is not configured");
-  const workspace = await mkdtemp(join(tmpdir(), "pocket-docker-isolation-"));
-  const hostSecretPath = join(homedir(), `.pocket-agent-host-secret-${process.pid}-${Date.now()}`);
-  await writeFile(hostSecretPath, "host-only\n", { mode: 0o600 });
+  const root = await mkdtemp(join(tmpdir(), "pocket-docker-isolation-"));
+  const workspace = join(root, "workspace");
+  const sibling = join(root, "sibling-repository", "private.txt");
+  const signalKey = join(homedir(), `.pocket-agent-signal-key-${process.pid}-${Date.now()}`);
+  const credentialStore = join(homedir(), `.pocket-agent-credential-store-${process.pid}-${Date.now()}`);
+  await mkdir(workspace);
+  await mkdir(join(root, "sibling-repository"));
+  await Promise.all([
+    writeFile(sibling, "sibling-only\n", { mode: 0o600 }),
+    writeFile(signalKey, "signal-only\n", { mode: 0o600 }),
+    writeFile(credentialStore, "connector-only\n", { mode: 0o600 }),
+  ]);
   t.after(() => Promise.all([
-    rm(workspace, { recursive: true, force: true }),
-    rm(hostSecretPath, { force: true }),
+    rm(root, { recursive: true, force: true }),
+    rm(signalKey, { force: true }),
+    rm(credentialStore, { force: true }),
   ]));
-  const previousSecret = process.env.POCKET_AGENT_HOST_TEST_SECRET;
-  process.env.POCKET_AGENT_HOST_TEST_SECRET = "must-not-enter-worker";
+
+  const hostServer = createServer((_request, response) => response.end("host-only"));
+  await new Promise<void>((resolve) => hostServer.listen(0, "0.0.0.0", resolve));
+  t.after(() => new Promise<void>((resolve, reject) => hostServer.close((error) => error ? reject(error) : resolve())));
+  const address = hostServer.address();
+  assert.ok(address && typeof address === "object");
+
+  const previousProvider = process.env.POCKET_AGENT_HOST_PROVIDER_KEY;
+  const previousConnector = process.env.POCKET_AGENT_HOST_CONNECTOR_TOKEN;
+  process.env.POCKET_AGENT_HOST_PROVIDER_KEY = "provider-secret-must-not-enter-worker";
+  process.env.POCKET_AGENT_HOST_CONNECTOR_TOKEN = "connector-secret-must-not-enter-worker";
   t.after(() => {
-    if (previousSecret === undefined) delete process.env.POCKET_AGENT_HOST_TEST_SECRET;
-    else process.env.POCKET_AGENT_HOST_TEST_SECRET = previousSecret;
+    if (previousProvider === undefined) delete process.env.POCKET_AGENT_HOST_PROVIDER_KEY;
+    else process.env.POCKET_AGENT_HOST_PROVIDER_KEY = previousProvider;
+    if (previousConnector === undefined) delete process.env.POCKET_AGENT_HOST_CONNECTOR_TOKEN;
+    else process.env.POCKET_AGENT_HOST_CONNECTOR_TOKEN = previousConnector;
   });
 
   const runner = new DockerSandboxRunner({ dockerPath, image: fixtureImage, allowUnpinnedImageForTests: true });
@@ -276,11 +309,16 @@ integration("sandboxed test tool cannot read host files, environment secrets, or
     events: { status: async () => {} },
   });
   t.after(() => job.dispose());
-  await job.start(`probe-isolation:${hostSecretPath}`);
-  assert.deepEqual(JSON.parse(await readFile(join(workspace, "isolation.json"), "utf8")), {
-    inheritedSecret: null,
-    hostFileAccessible: false,
-    dockerSocketAccessible: false,
+  const payload = Buffer.from(JSON.stringify({
+    paths: [sibling, signalKey, credentialStore, "/var/run/docker.sock"],
+    hostPort: address.port,
+  })).toString("base64url");
+  await job.start(`probe-boundary:${payload}`);
+  assert.deepEqual(JSON.parse(await readFile(join(workspace, "boundary.json"), "utf8")), {
+    readablePaths: [],
+    inheritedSecrets: [],
+    internetReachable: false,
+    hostPortReachable: false,
   });
 });
 
@@ -327,11 +365,56 @@ integration("Docker adapter bounds deadlines and reports worker crashes", async 
     outputLimitBytes: 64 * 1024,
     events: { status: async () => {} },
   });
-  const cancellation = assert.rejects(cancelled.start("hang"), /cancelled/);
+  const cancellation = assert.rejects(cancelled.start("ignore-cancel"), /cancelled/);
   await new Promise((resolve) => setTimeout(resolve, 100));
   await cancelled.cancel();
   await cancellation;
   assert.equal(await docker("ps", "--all", "--quiet", "--filter", `label=pocket-agent.job-id=${cancelled.id}`), "");
+});
+
+integration("Docker byte and storage limits fail closed and reclaim resources", async (t) => {
+  if (!fixtureImage) return t.skip("fixture image is not configured");
+  const root = await mkdtemp(join(tmpdir(), "pocket-docker-byte-limits-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const runner = new DockerSandboxRunner({
+    dockerPath,
+    image: fixtureImage,
+    allowUnpinnedImageForTests: true,
+    limits: { temporaryStorageBytes: 8 * 1024 * 1024, workspaceStorageBytes: 16 * 1024 * 1024 },
+  });
+
+  const disk = await runner.create({
+    id: `disk-${process.pid}`,
+    workspacePath: root,
+    conversationId: "test",
+    repositoryScope: "repo",
+    deadlineAt: new Date(Date.now() + 30_000),
+    outputLimitBytes: 64 * 1024,
+    events: { status: async () => {} },
+  });
+  t.after(() => disk.dispose());
+  assert.equal(await disk.start("disk-pressure"), "completed disk-pressure");
+  assert.deepEqual(JSON.parse(await readFile(join(root, "disk.json"), "utf8")), { bounded: true });
+  await disk.dispose();
+
+  const output = await runner.create({
+    id: `output-${process.pid}`,
+    workspacePath: root,
+    conversationId: "test",
+    repositoryScope: "repo",
+    deadlineAt: new Date(Date.now() + 30_000),
+    outputLimitBytes: 1_024,
+    events: { status: async () => {} },
+  });
+  t.after(() => output.dispose());
+  const containerId = await docker("ps", "--all", "--quiet", "--filter", `label=pocket-agent.job-id=${output.id}`);
+  const inspected = JSON.parse(await docker("inspect", containerId))[0];
+  const volume = inspected.Mounts.find((mount: { Destination: string }) => mount.Destination === "/workspace").Name as string;
+  await assert.rejects(output.start("huge-output"), (error: unknown) =>
+    error instanceof SandboxFailure && error.code === "output_limit_exceeded",
+  );
+  await waitForMissingDockerObject(containerId);
+  await assert.rejects(docker("volume", "inspect", volume));
 });
 
 integration("Docker kernel limits contain process and memory pressure", async (t) => {

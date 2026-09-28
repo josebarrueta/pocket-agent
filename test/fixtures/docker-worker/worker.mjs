@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
-import { appendFile, readFile } from "node:fs/promises";
+import { appendFile, readFile, rm, writeFile } from "node:fs/promises";
 import { request as httpRequest } from "node:http";
+import { createConnection } from "node:net";
 import { createInterface } from "node:readline";
 
 const send = (message) => process.stdout.write(`${JSON.stringify(message)}\n`);
@@ -16,7 +17,10 @@ for await (const line of lines) {
     negotiated = true;
     continue;
   }
-  if (message.type === "cancel") process.exit(0);
+  if (message.type === "cancel") {
+    if (active?.prompt === "ignore-cancel") continue;
+    process.exit(0);
+  }
   if (message.type === "approval_response" && active) {
     await appendFile("/workspace/approval.txt", `${message.answer}\n`);
     send({ protocolVersion: 1, type: "completion", jobId: active.jobId, runId: active.runId, output: "approval handled" });
@@ -33,7 +37,11 @@ for await (const line of lines) {
   }
   if (message.type !== "start") process.exit(64);
   if (message.prompt === "crash") process.exit(23);
-  if (message.prompt === "hang") { active = message; continue; }
+  if (message.prompt === "hang" || message.prompt === "ignore-cancel") { active = message; continue; }
+  if (message.prompt === "huge-output") {
+    send({ protocolVersion: 1, type: "completion", jobId: message.jobId, runId: message.runId, output: "x".repeat(message.outputLimitBytes + 1) });
+    continue;
+  }
   if (message.prompt === "approval") {
     active = message;
     send({
@@ -92,6 +100,32 @@ for await (const line of lines) {
       hostFileAccessible,
       dockerSocketAccessible,
     }));
+  }
+  if (message.prompt.startsWith("probe-boundary:")) {
+    const probe = JSON.parse(Buffer.from(message.prompt.slice("probe-boundary:".length), "base64url").toString("utf8"));
+    const readablePaths = [];
+    for (const path of probe.paths) {
+      try { await readFile(path); readablePaths.push(path); } catch {}
+    }
+    const connect = (host, port) => new Promise((resolve) => {
+      const socket = createConnection({ host, port });
+      const done = (value) => { socket.destroy(); resolve(value); };
+      socket.setTimeout(500, () => done(false));
+      socket.once("connect", () => done(true));
+      socket.once("error", () => done(false));
+    });
+    await writeFile("/workspace/boundary.json", JSON.stringify({
+      readablePaths,
+      inheritedSecrets: Object.keys(process.env).filter((key) => key.startsWith("POCKET_AGENT_HOST_")),
+      internetReachable: await connect("1.1.1.1", 53),
+      hostPortReachable: await connect("172.17.0.1", probe.hostPort),
+    }));
+  }
+  if (message.prompt === "disk-pressure") {
+    let bounded = false;
+    try { await writeFile("/workspace/fill", Buffer.alloc(32 * 1024 * 1024, 1)); } catch (error) { bounded = error?.code === "ENOSPC"; }
+    await rm("/workspace/fill", { force: true });
+    await writeFile("/workspace/disk.json", JSON.stringify({ bounded }));
   }
   if (message.prompt === "fork-pressure") {
     for (let index = 0; index < 256; index += 1) {

@@ -151,9 +151,9 @@ MCP is the mediation protocol, not the isolation mechanism. The sandbox provides
 7. The broker denies it, allows it by policy, or asks the operator through Signal.
 8. If approved, the broker performs exactly the normalized operation and records the result.
 9. The worker submits a patch. Applying it to the host repository remains a separate policy or approval decision.
-10. Completion, cancellation, or timeout revokes the job identity and destroys the worker.
+10. Cancellation, timeout, failure, or controller shutdown revokes the job identity and destroys the worker. A successful turn may leave the job idle for a later turn in the same in-memory Pi session.
 
-## Current implementation gap
+## Current implementation
 
 Pi, its built-in read/write/bash tools, and its in-memory session now run only inside the Docker worker. The host package no longer installs Pi or exposes a host-side agent/MCP adapter. Workers receive only a disposable workspace, safe model-selection metadata, and normalized approval responses; they receive no host environment or credentials.
 

@@ -232,6 +232,10 @@ async function startRun(message) {
     if (active.runId !== message.runId || active.terminal) return;
     await session.prompt(message.prompt);
     if (active.runId !== message.runId || active.terminal) return;
+    const lastAssistant = [...session.messages].reverse().find((entry) => entry?.role === "assistant");
+    if (lastAssistant?.stopReason === "error" || lastAssistant?.stopReason === "aborted") {
+      throw new Error(lastAssistant.errorMessage || "Model request failed");
+    }
     const output = session.getLastAssistantText() || "(Agent completed without a text response.)";
     if (Buffer.byteLength(output, "utf8") > message.outputLimitBytes) {
       terminalFailure(message, "output_limit_exceeded", "Worker output exceeded its byte limit", false);
