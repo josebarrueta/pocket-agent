@@ -119,14 +119,14 @@ impl ModelProxy {
     pub async fn start(self: &Arc<Self>) -> Result<()> {
         if let Some(parent) = self.socket.parent() {
             std::fs::create_dir_all(parent)?;
-            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
+            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o711))?;
         }
         if let Some(parent) = self.audit.parent() {
             std::fs::create_dir_all(parent)?;
         }
         let _ = std::fs::remove_file(&self.socket);
         let listener = UnixListener::bind(&self.socket)?;
-        std::fs::set_permissions(&self.socket, std::fs::Permissions::from_mode(0o600))?;
+        std::fs::set_permissions(&self.socket, std::fs::Permissions::from_mode(0o666))?;
         let (shutdown, mut receiver) = oneshot::channel();
         *self.shutdown.lock().await = Some(shutdown);
         let proxy = self.clone();
