@@ -166,7 +166,12 @@ impl Config {
         );
         if let Some(signal) = &config.signal {
             ensure!(
-                !signal.account.is_empty() && !signal.allowed_senders.is_empty(),
+                !signal.account.is_empty()
+                    && !signal.allowed_senders.is_empty()
+                    && signal
+                        .allowed_senders
+                        .iter()
+                        .all(|sender| !sender.is_empty()),
                 "Signal requires an account and allowed senders"
             );
             ensure!(

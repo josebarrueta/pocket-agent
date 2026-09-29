@@ -4,12 +4,13 @@ The trusted host is migrating to one Rust binary. Pi remains in the isolated Nod
 
 ## Ingress seam
 
-`Harness` accepts a `HarnessRequest` containing an ingress ID, authenticated principal ID, conversation ID, request ID, and transport-neutral command. It emits structured `HarnessEvent` values through `ReplyPort`. The CLI is the first Rust ingress; Signal remains optional and is being ported at the same seam.
+`Harness` accepts a `HarnessRequest` containing an ingress ID, authenticated principal ID, conversation ID, request ID, and transport-neutral command. It emits structured `HarnessEvent` values through `ReplyPort`. CLI and Signal are peer Rust ingress adapters at this seam; Signal remains optional.
 
 ```bash
 cargo build --release --locked
 ./target/release/pocket-agent --config config.json run --repo app --prompt 'Fix the parser'
 ./target/release/pocket-agent --config config.json shell --repo app
+./target/release/pocket-agent --config config.json serve signal
 ```
 
 `run` exits after one turn. `shell` retains the in-memory job and accepts additional prompts until `/exit`. Approval events prompt on the terminal and are answered through the same principal-, ingress-, conversation-, and job-scoped harness path used by remote adapters.
@@ -26,7 +27,9 @@ cargo build --release --locked
 
 The provider key is read from `agent.apiKeyEnv` into the host process. The worker receives a random revocable lease, fixed model metadata, and a read-only socket-directory mount. It does not receive the provider key or provider URL.
 
-The Rust CLI exposes built-in worker tools and the four curated workspace capabilities. Capability scope comes only from the authenticated job lease; no capability accepts a host path or command. Applying a submitted canonical patch requires a conversation- and job-scoped operator approval. Signal continues to use the TypeScript host until its Rust adapter reaches parity. The TypeScript host will then be removed, leaving Node only in the worker image.
+The Rust host exposes built-in worker tools and the four curated workspace capabilities. Capability scope comes only from the authenticated job lease; no capability accepts a host path or command. Applying a submitted canonical patch requires a conversation- and job-scoped operator approval.
+
+`serve signal` requires the optional `signal` configuration, waits for the local `signal-cli` HTTP/SSE daemon, accepts only allowlisted private senders, ignores group and sync messages, and formats structured harness events back into bounded Signal messages. CLI commands do not require Signal configuration. Signal account keys remain in the separately hardened daemon and never enter workers.
 
 ## Platform behavior
 

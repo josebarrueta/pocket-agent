@@ -7,6 +7,7 @@ pub mod domain;
 pub mod harness;
 pub mod model_proxy;
 pub mod ports;
+pub mod signal;
 pub mod workspace;
 
 #[cfg(test)]

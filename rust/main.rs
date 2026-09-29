@@ -10,12 +10,13 @@ use async_trait::async_trait;
 use clap::Parser;
 use pocket_agent::{
     capability::{CapabilityBroker, CapabilityLimits},
-    cli::{Cli, CliIngress, Terminal},
+    cli::{Cli, CliCommand, CliIngress, ServeCommand, Terminal},
     config::Config,
     docker::{DockerJobFactory, DockerJobFactoryConfig, DockerLimits},
     harness::Harness,
     model_proxy::{ModelDescriptor, ModelProxy, ModelProxyLimits},
     ports::{CombinedAccessIssuers, JobFactory, WorkerAccessIssuer},
+    signal::SignalIngress,
     workspace::{WorkspaceLimits, WorkspaceManager},
 };
 
@@ -54,6 +55,17 @@ async fn main() {
 async fn run() -> Result<()> {
     let cli = Cli::parse();
     let config = Config::load(&cli.config)?;
+    if matches!(
+        &cli.command,
+        CliCommand::Serve {
+            ingress: ServeCommand::Signal
+        }
+    ) && config.signal.is_none()
+    {
+        return Err(anyhow!(
+            "Signal configuration is required for 'serve signal'"
+        ));
+    }
     let api_key = std::env::var(&config.agent.api_key_env).with_context(|| {
         format!(
             "Configured model credential {} is not set",
@@ -137,8 +149,28 @@ async fn run_with_proxy(cli: Cli, config: Config, proxy: Arc<ModelProxy>) -> Res
         let principal = std::env::var("USER")
             .or_else(|_| std::env::var("USERNAME"))
             .unwrap_or_else(|_| "local".into());
-        let ingress = CliIngress::new(harness.clone(), Arc::new(StandardTerminal), principal);
-        let result = ingress.run(cli.command).await;
+        let result = match cli.command {
+            CliCommand::Serve {
+                ingress: ServeCommand::Signal,
+            } => {
+                let signal = config.signal.ok_or_else(|| {
+                    anyhow!("Signal configuration is required for 'serve signal'")
+                })?;
+                SignalIngress::new(
+                    harness.clone(),
+                    signal.daemon_url,
+                    signal.account,
+                    signal.allowed_senders,
+                )?
+                .run()
+                .await
+            }
+            command => {
+                CliIngress::new(harness.clone(), Arc::new(StandardTerminal), principal)
+                    .run(command)
+                    .await
+            }
+        };
         harness.close().await;
         result
     }

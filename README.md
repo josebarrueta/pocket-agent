@@ -8,7 +8,7 @@ The local CLI, Signal, and future authenticated HTTP endpoints are ingress adapt
 
 ## Ingress adapters
 
-Signal was the first remote adapter because it supports a private, self-hosted workflow through the unofficial `signal-cli` daemon without a public webhook. It is not the harness entry point or part of the domain model. The trusted host is being migrated to Rust with a first-class local CLI; Signal will sit beside it as an optional adapter. See [ADR 0001](docs/adr/0001-rust-host-and-ingress-adapters.md) and [`docs/rust-host.md`](docs/rust-host.md).
+Signal was the first remote adapter because it supports a private, self-hosted workflow through the unofficial `signal-cli` daemon without a public webhook. It is not the harness entry point or part of the domain model. The Rust host exposes Signal beside its first-class local CLI as an optional adapter. See [ADR 0001](docs/adr/0001-rust-host-and-ingress-adapters.md) and [`docs/rust-host.md`](docs/rust-host.md).
 
 ## Target architecture
 
@@ -47,7 +47,11 @@ cargo run --release -- --config ./config.json run --repo app --bug "Parser panic
 cargo run --release -- --config ./config.json shell --repo app
 ```
 
-It uses the same hardened Docker worker, disposable workspace, scoped capability broker, and host-only model credential path. Signal currently remains on the legacy TypeScript host while its optional Rust ingress adapter is ported.
+Both local commands and `serve signal` use the same hardened Docker worker, disposable workspace, scoped capability broker, and host-only model credential path:
+
+```bash
+cargo run --release -- --config ./config.json serve signal
+```
 
 - `/new <repo> <task>` starts a persistent Pi conversation through Signal.
 - `/bug <repo> <description>` asks Pi to reproduce, fix and test a bug.
@@ -63,7 +67,7 @@ It uses the same hardened Docker worker, disposable workspace, scoped capability
 ## Prerequisites
 
 - Rust 1.88+ for the new trusted-host harness
-- Node.js 20.12+ while the TypeScript host remains during migration and for worker dependency builds
+- Node.js 20.12+ for worker dependency builds (Node is not required by the Rust host binary)
 - A digest-pinned Pocket Agent worker image built from this repository
 - Docker (recommended for `signal-cli` and MCP isolation)
 - A Signal account. Linking `signal-cli` as a secondary device is recommended.
@@ -133,7 +137,7 @@ Edit `config.json`:
 - `agent.apiKeyEnv`: host environment variable containing that provider's API key; its value is never passed to workers.
 - `permissions`: `allow`, `ask`, or `deny` for reads, writes, and shell calls inside the worker.
 
-Then export only the configured host credential. Run the Rust CLI locally, or start the legacy Signal adapter during migration:
+Then export only the configured host credential. Run the Rust CLI locally or start its optional Signal ingress:
 
 ```bash
 export ANTHROPIC_API_KEY='...'
@@ -141,9 +145,8 @@ export ANTHROPIC_API_KEY='...'
 # First-class local ingress
 cargo run --release -- --config ./config.json run --repo app --prompt "Review this repository"
 
-# Signal ingress during the Rust migration
-npm run check
-npm run dev -- ./config.json
+# Optional Signal ingress
+cargo run --release -- --config ./config.json serve signal
 ```
 
 Use the variable named by `agent.apiKeyEnv`; the example above matches `config.example.json`.
