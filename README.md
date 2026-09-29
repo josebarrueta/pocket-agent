@@ -66,10 +66,9 @@ cargo run --release -- --config ./config.json serve signal
 
 ## Prerequisites
 
-- Rust 1.88+ for the new trusted-host harness
-- A digest-pinned Pocket Agent worker image built from this repository
-- Docker (recommended for `signal-cli` and MCP isolation)
-- A Signal account. Linking `signal-cli` as a secondary device is recommended.
+- Rust 1.88+ to build the trusted host
+- Docker with a native Linux daemon to run isolated jobs and private Unix-socket transports
+- Optional: a Signal account for the Signal ingress. Linking `signal-cli` as a secondary device is recommended.
 
 ## The worker image
 
@@ -89,68 +88,106 @@ The final image is `FROM scratch`: it has no shell, package manager, curl, Java 
 
 A separate one-off `link-helper` build target contains `qrencode` and a shell solely to display the device-link QR code. It is not used by the long-running daemon.
 
-## Setup
+## Installation
+
+### 1. Install the trusted host
+
+Install from a reviewed checkout:
 
 ```bash
-cargo build --release --locked
+git clone https://github.com/josebarrueta/pocket-agent.git
+cd pocket-agent
+cargo install --locked --path .
+pocket-agent --help
+```
+
+To avoid installing into `~/.cargo/bin`, use `cargo build --release --locked` and run `./target/release/pocket-agent` instead. The resulting host is a single stripped Rust binary; Node is present only inside the worker image.
+
+### 2. Build an immutable worker
+
+For a local, single-platform installation, build the worker and record its immutable image ID:
+
+```bash
+docker buildx build \
+  --load \
+  --file docker/worker/Dockerfile \
+  --tag pocket-agent/worker:local \
+  --iidfile .pocket-agent-worker.iid \
+  .
+cat .pocket-agent-worker.iid   # sha256:...
+```
+
+Set `sandbox.image` to that complete `sha256:...` value. A registry deployment may instead use `registry.example/worker@sha256:...`; see [`docs/worker-image.md`](docs/worker-image.md) for multi-platform publishing and verification.
+
+### 3. Configure and run
+
+```bash
 cp config.example.json config.json
+```
+
+Edit `config.json`:
+
+- `repositories`: safe aliases mapped to absolute Git worktree roots. Prompts select aliases, never host paths.
+- `sandbox.dockerPath`: the absolute Docker executable path.
+- `sandbox.image`: the complete local image ID or registry manifest digest from the previous step.
+- `agent.model`: a fixed `provider/model-id`. `anthropic/...` uses Anthropic Messages; other providers use the OpenAI-compatible adapter.
+- `agent.apiKeyEnv`: the name of the host environment variable containing the provider key.
+- `agent.baseUrl`: optional trusted HTTPS endpoint for an OpenAI-compatible provider.
+- `permissions`: `allow`, `ask`, or `deny` for worker reads, writes, and shell calls.
+- `signal`: optional for CLI use; remove it entirely unless using `serve signal`.
+
+Export only the configured host credential, then run a job:
+
+```bash
+export ANTHROPIC_API_KEY='...'
+pocket-agent --config ./config.json run \
+  --repo website \
+  --prompt "Find the failing checkout test, fix it, and run the focused test suite"
+```
+
+The original checkout is not mounted into the worker. The command prints the result and a changed-file manifest for the candidate patch.
+
+### Install with your favorite coding harness
+
+If you prefer agent-assisted setup, paste this into your preferred coding harness from the directory where you want the checkout:
+
+```text
+Clone https://github.com/josebarrueta/pocket-agent.git and install its Rust host
+using the locked dependencies. Build the reviewed Docker worker and save its immutable
+sha256 image ID. Copy config.example.json to config.json, but do not invent repository
+paths, provider credentials, or Signal identities. Ask me for those values, keep secrets
+out of files and command output, validate with cargo fmt, clippy, and test, then show me
+the exact pocket-agent CLI command for a one-turn run. Do not weaken image pinning,
+Docker isolation, sender allowlists, or approval defaults.
+```
+
+The setup agent may build and validate the project, but you should supply credentials yourself and perform Signal device linking manually.
+
+## Optional Signal installation
+
+The CLI requires no Signal configuration. To enable Signal, configure `signal.account`, `signal.allowedSenders`, and `signal.daemonUrl`, then link the minimal daemon:
+
+```bash
 mkdir -p signal-cli-data
 chmod 700 signal-cli-data
 
 # Build only from this repository's reviewed Dockerfile.
 docker compose build --pull
 
-# One-time device linking. Scan the displayed QR in Signal under:
-# Settings → Linked devices → +
+# One-time linking. Scan the QR in Signal under Settings → Linked devices → +.
 docker compose --profile setup run --rm signal-link
 
-# Start the minimal daemon after linking completes.
+# Start the daemon and verify it before starting the ingress.
 docker compose up -d signal-cli
 curl --fail http://127.0.0.1:8080/api/v1/check
+pocket-agent --config ./config.json serve signal
 ```
 
-On Linux, the container runs as UID/GID `65532`. If the link command reports a permission error, set ownership before retrying:
+Send `/help` to the linked account from an allowlisted private Signal account. Group and sync messages are ignored.
 
-```bash
-sudo chown -R 65532:65532 signal-cli-data
-```
+On Linux, the Signal container runs as UID/GID `65532`. If linking reports a permission error, run `sudo chown -R 65532:65532 signal-cli-data` before retrying. Keep this directory private and backed up because it contains linked-device cryptographic material; never run the link helper while the daemon is using the same database.
 
-On Apple Silicon, Compose runs the upstream x86-64 native release under Docker's `linux/amd64` emulation. This is slower at startup but avoids adding a Java runtime or maintaining an unverified custom native build.
-
-Keep `signal-cli-data` private and backed up securely; it contains linked-device cryptographic material. Do not run `signal-link` while the daemon is running because both processes would contend for the same account database.
-
-Build the worker and copy its local digest into `sandbox.image`:
-
-```bash
-docker buildx build --load --file docker/worker/Dockerfile --tag pocket-agent/worker:0.1.0 .
-docker image inspect pocket-agent/worker:0.1.0 --format '{{index .RepoDigests 0}}'
-```
-
-Edit `config.json`:
-
-- `account`: the linked Signal account in international format.
-- `allowedSenders`: exact trusted sender number(s) or UUID(s). Pairing is never performed over chat.
-- `repositories`: chat-safe aliases mapped to absolute local paths.
-- `sandbox.image`: the complete digest-pinned worker image reference from the build.
-- `agent.model`: required `provider/model-id`, fixed for all job leases.
-- `agent.apiKeyEnv`: host environment variable containing that provider's API key; its value is never passed to workers.
-- `permissions`: `allow`, `ask`, or `deny` for reads, writes, and shell calls inside the worker.
-
-Then export only the configured host credential. Run the Rust CLI locally or start its optional Signal ingress:
-
-```bash
-export ANTHROPIC_API_KEY='...'
-
-# First-class local ingress
-cargo run --release -- --config ./config.json run --repo app --prompt "Review this repository"
-
-# Optional Signal ingress
-cargo run --release -- --config ./config.json serve signal
-```
-
-Use the variable named by `agent.apiKeyEnv`; the example above matches `config.example.json`.
-
-Send `/help` to the linked account from an allowlisted Signal account.
+On Apple Silicon, Compose runs the upstream x86-64 native Signal release under emulation. More importantly, Docker Desktop cannot forward the host capability/model Unix sockets through its VM, so coding jobs fail closed there; use a native Linux Docker host for the complete system.
 
 ## Example conversation
 

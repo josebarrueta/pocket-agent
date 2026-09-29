@@ -91,12 +91,7 @@ impl DockerJobFactory {
             "Docker and tar paths must be absolute"
         );
         ensure!(
-            config.allow_unpinned_image_for_tests
-                || config
-                    .image
-                    .rsplit_once("@sha256:")
-                    .is_some_and(|(_, digest)| digest.len() == 64
-                        && digest.bytes().all(|byte| byte.is_ascii_hexdigit())),
+            config.allow_unpinned_image_for_tests || is_pinned_image(&config.image),
             "Worker image must be digest-pinned"
         );
         ensure!(
@@ -909,6 +904,15 @@ fn revoke(leases: &[Arc<dyn WorkerLease>]) {
         lease.revoke();
     }
 }
+fn is_pinned_image(image: &str) -> bool {
+    let digest = image
+        .strip_prefix("sha256:")
+        .or_else(|| image.rsplit_once("@sha256:").map(|(_, digest)| digest));
+    digest.is_some_and(|digest| {
+        digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+    })
+}
+
 fn deadline_timestamp(duration: Duration) -> Result<String> {
     let duration =
         time::Duration::try_from(duration).map_err(|_| anyhow!("Job timeout is too large"))?;

@@ -2,7 +2,7 @@
 
 `docker/worker/Dockerfile` builds the disposable job runtime for `linux/amd64` and `linux/arm64`. It contains Node.js, Pi, the protocol entrypoint, and an explicit baseline toolset: Bash, CA certificates, Git, GNU C/C++ and Make, Patch, Python 3, and ripgrep. It does not install a Docker/Podman client or copy configuration, credentials, repository content, or the host application into the image.
 
-The entrypoint owns an in-memory Pi session and explicitly enables built-in `read`, `bash`, `edit`, and `write` tools rooted at `/workspace`. It disables project/global extensions, skills, prompt templates, and themes, then loads only three host-supplied inline extensions: tool approval policy, the authenticated workspace capability client, and the credential-free model proxy provider. Scoped MCP tools are translated to provider-safe Pi tool names and remain subject to host broker policy. The proxy provider accepts only safe model metadata and streams over its job socket; no provider key enters the image. Extension initialization errors fail the run closed. The entrypoint emits bounded tool status and implements start, steer, cancel, completion, failure, and approval messages. No Pi runtime or built-in execution tool is installed in the host application; the host uses only Pi AI provider adapters.
+The entrypoint owns an in-memory Pi session and explicitly enables built-in `read`, `bash`, `edit`, and `write` tools rooted at `/workspace`. It disables project/global extensions, skills, prompt templates, and themes, then loads only three host-supplied inline extensions: tool approval policy, the authenticated workspace capability client, and the credential-free model proxy provider. Scoped MCP tools are translated to provider-safe Pi tool names and remain subject to host broker policy. The proxy provider accepts only safe model metadata and streams over its job socket; no provider key enters the image. Extension initialization errors fail the run closed. The entrypoint emits bounded tool status and implements start, steer, cancel, completion, failure, and approval messages. No Pi runtime or built-in execution tool is installed in the host application; the Rust host uses native Anthropic and OpenAI-compatible provider adapters.
 
 ## Build and smoke test
 
@@ -15,8 +15,10 @@ docker buildx build \
   --tag pocket-agent/worker:0.1.0 \
   .
 
-# Load the local platform and test the same restrictions used by CI.
-docker buildx build --load --file docker/worker/Dockerfile --tag pocket-agent/worker:test .
+# Load the local platform, record its immutable ID, and test CI's restrictions.
+docker buildx build --load --file docker/worker/Dockerfile \
+  --tag pocket-agent/worker:test --iidfile .pocket-agent-worker.iid .
+cat .pocket-agent-worker.iid  # use this sha256:... value as sandbox.image
 docker run --rm \
   --read-only \
   --tmpfs /tmp:rw,nosuid,nodev,noexec,size=16m \

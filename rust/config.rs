@@ -210,7 +210,10 @@ fn expand_home(path: &Path) -> Result<PathBuf> {
 }
 
 fn is_digest_pinned(image: &str) -> bool {
-    image.rsplit_once("@sha256:").is_some_and(|(_, digest)| {
+    let digest = image
+        .strip_prefix("sha256:")
+        .or_else(|| image.rsplit_once("@sha256:").map(|(_, digest)| digest));
+    digest.is_some_and(|digest| {
         digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
     })
 }
@@ -304,6 +307,13 @@ mod tests {
             .is_err()
         );
         assert!(load(&valid("").replace("anthropic/claude", "claude")).is_err());
+        assert!(
+            load(&valid("").replace(
+                &format!("worker@sha256:{}", "a".repeat(64)),
+                &format!("sha256:{}", "b".repeat(64))
+            ))
+            .is_ok()
+        );
         assert!(load(&valid("").replace("ANTHROPIC_API_KEY", "bad-key")).is_err());
     }
 }

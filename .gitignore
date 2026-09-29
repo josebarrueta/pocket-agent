@@ -1,6 +1,7 @@
 node_modules/
 dist/
 target/
+.pocket-agent-worker.iid
 config.json
 signal-cli-data/
 .env
