@@ -9,13 +9,44 @@ use pocket_agent::{
     docker::{DockerJobFactory, DockerJobFactoryConfig, DockerLimits},
     domain::{ApprovalRequest, JobSpec},
     model_proxy::{ModelDescriptor, ModelProxy, ModelProxyLimits},
-    ports::{JobEventPort, JobFactory, WorkerAccessIssuer},
+    ports::{JobEventPort, JobFactory, PrivateMount, WorkerAccessIssuer, WorkerLease},
     workspace::{WorkspaceLimits, WorkspaceManager},
 };
 use serde_json::json;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 struct Events;
+
+struct MissingBrokerIssuer(PathBuf);
+struct MissingBrokerLease(PathBuf);
+
+#[async_trait]
+impl WorkerAccessIssuer for MissingBrokerIssuer {
+    async fn issue(&self, _spec: &JobSpec) -> Result<Vec<Arc<dyn WorkerLease>>> {
+        Ok(vec![Arc::new(MissingBrokerLease(self.0.clone()))])
+    }
+}
+
+impl WorkerLease for MissingBrokerLease {
+    fn environment(&self) -> BTreeMap<String, String> {
+        BTreeMap::from([
+            (
+                "POCKET_AGENT_MCP_SOCKET".into(),
+                "/run/pocket-agent-broker/missing.sock".into(),
+            ),
+            ("POCKET_AGENT_MCP_CREDENTIAL".into(), "unusable".into()),
+        ])
+    }
+
+    fn mounts(&self) -> Vec<PrivateMount> {
+        vec![PrivateMount {
+            source: self.0.clone(),
+            destination: PathBuf::from("/run/pocket-agent-broker"),
+        }]
+    }
+
+    fn revoke(&self) {}
+}
 
 fn docker_test_lock() -> &'static tokio::sync::Mutex<()> {
     static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
@@ -371,6 +402,15 @@ fn fixture_factory(
     image: &std::ffi::OsStr,
     limits: DockerLimits,
 ) -> Result<(DockerJobFactory, PathBuf)> {
+    fixture_factory_with_access(root, image, limits, None)
+}
+
+fn fixture_factory_with_access(
+    root: &std::path::Path,
+    image: &std::ffi::OsStr,
+    limits: DockerLimits,
+    access: Option<Arc<dyn WorkerAccessIssuer>>,
+) -> Result<(DockerJobFactory, PathBuf)> {
     let source = root.join("source");
     std::fs::create_dir_all(&source)?;
     git(&source, &["init", "--quiet"]);
@@ -399,7 +439,7 @@ fn fixture_factory(
             permissions: r#"{"read":"allow","write":"allow","bash":"allow"}"#.into(),
             limits,
             workspaces,
-            access: None,
+            access,
             allow_unpinned_image_for_tests: true,
         })?,
         docker_path,
@@ -454,6 +494,43 @@ async fn wait_for_missing(docker_path: &std::path::Path, kind: &str, id: &str) {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     panic!("Docker object {id} was not reclaimed");
+}
+
+#[tokio::test]
+async fn real_worker_fails_closed_when_private_broker_is_unavailable() -> Result<()> {
+    let _guard = docker_test_lock().lock().await;
+    if cfg!(target_os = "macos") {
+        return Ok(());
+    }
+    let Some(image) = std::env::var_os("POCKET_AGENT_DOCKER_TEST_IMAGE") else {
+        return Ok(());
+    };
+    let root = PathBuf::from("/tmp").join(format!("pa-missing-broker-{}", uuid::Uuid::new_v4()));
+    let socket_directory = root.join("broker");
+    std::fs::create_dir_all(&socket_directory)?;
+    let access: Arc<dyn WorkerAccessIssuer> = Arc::new(MissingBrokerIssuer(socket_directory));
+    let (factory, _) = fixture_factory_with_access(
+        &root,
+        &image,
+        DockerLimits {
+            job_timeout: Duration::from_secs(30),
+            ..DockerLimits::default()
+        },
+        Some(access),
+    )?;
+    let job = fixture_job(&factory, "missing-broker").await?;
+    let error = job
+        .run_turn("initialize capabilities", Arc::new(Events))
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("Worker extension initialization failed")
+    );
+    assert!(error.to_string().contains("missing.sock"));
+    let _ = std::fs::remove_dir_all(root);
+    Ok(())
 }
 
 #[tokio::test]

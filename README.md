@@ -10,7 +10,7 @@ The local CLI, Signal, and future authenticated HTTP endpoints are ingress adapt
 
 Signal was the first remote adapter because it supports a private, self-hosted workflow through the unofficial `signal-cli` daemon without a public webhook. It is not the harness entry point or part of the domain model. The Rust host exposes Signal beside its first-class local CLI as an optional adapter. See [ADR 0001](docs/adr/0001-rust-host-and-ingress-adapters.md) and [`docs/rust-host.md`](docs/rust-host.md).
 
-## Target architecture
+## Architecture
 
 ```mermaid
 flowchart LR
@@ -67,14 +67,13 @@ cargo run --release -- --config ./config.json serve signal
 ## Prerequisites
 
 - Rust 1.88+ for the new trusted-host harness
-- Node.js 20.12+ for worker dependency builds (Node is not required by the Rust host binary)
 - A digest-pinned Pocket Agent worker image built from this repository
 - Docker (recommended for `signal-cli` and MCP isolation)
 - A Signal account. Linking `signal-cli` as a secondary device is recommended.
 
 ## The worker image
 
-The pinned, multi-platform worker image packages Pi and baseline build tools under numeric UID/GID `65532`. Its protocol entrypoint owns the in-memory Pi session, built-in tools, steering, cancellation, status, and tool approvals. It runs with a read-only root filesystem and contains no credentials or container client. See [`docs/worker-image.md`](docs/worker-image.md) for builds, hardened smoke tests, SBOM inspection, and the update procedure. The [`DockerSandboxRunner`](docs/docker-sandbox.md) adds per-job resource, filesystem, network, lifecycle, and cleanup controls.
+The pinned, multi-platform worker image packages Pi and baseline build tools under numeric UID/GID `65532`. Its protocol entrypoint owns the in-memory Pi session, built-in tools, steering, cancellation, status, and tool approvals. It runs with a read-only root filesystem and contains no credentials or container client. See [`docs/worker-image.md`](docs/worker-image.md) for builds, hardened smoke tests, SBOM inspection, and the update procedure. The Rust [`DockerJobFactory`](docs/docker-sandbox.md) adds per-job resource, filesystem, network, lifecycle, and cleanup controls.
 
 ## The Signal image
 
@@ -93,7 +92,7 @@ A separate one-off `link-helper` build target contains `qrencode` and a shell so
 ## Setup
 
 ```bash
-npm install
+cargo build --release --locked
 cp config.example.json config.json
 mkdir -p signal-cli-data
 chmod 700 signal-cli-data
@@ -195,9 +194,15 @@ The old host-side MCP extension was removed with host-side Pi. MCP servers are e
 ## Development
 
 ```bash
-npm test
-npm run build
-npm run check
+cargo fmt --all -- --check
+cargo clippy --locked --all-targets --all-features -- -D warnings
+cargo test --locked
+
+# Native Linux Docker parity matrix after building the two test images
+POCKET_AGENT_DOCKER_TEST_IMAGE=pocket-agent/worker:test \
+POCKET_AGENT_DOCKER_FIXTURE_IMAGE=pocket-agent/worker-fixture:test \
+POCKET_AGENT_DOCKER_PATH=/usr/bin/docker \
+cargo test --locked --test rust_docker -- --test-threads=1
 ```
 
 See [`SECURITY.md`](SECURITY.md) before exposing the daemon or adding MCP servers.

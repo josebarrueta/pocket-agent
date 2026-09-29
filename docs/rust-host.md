@@ -1,6 +1,6 @@
 # Rust trusted host
 
-The trusted host is migrating to one Rust binary. Pi remains in the isolated Node worker; the host does not link or initialize Pi.
+The trusted host is one Rust binary. Pi remains in the isolated Node worker; the host does not link or initialize Pi, and its deployment requires no host Node runtime.
 
 ## Ingress seam
 
@@ -31,6 +31,10 @@ The Rust host exposes built-in worker tools and the four curated workspace capab
 
 `serve signal` requires the optional `signal` configuration, waits for the local `signal-cli` HTTP/SSE daemon, accepts only allowlisted private senders, ignores group and sync messages, and formats structured harness events back into bounded Signal messages. CLI commands do not require Signal configuration. Signal account keys remain in the separately hardened daemon and never enter workers.
 
+## Footprint
+
+The release profile enables thin LTO, one codegen unit, abort-on-panic, and symbol stripping. A local macOS arm64 release build measured 3,389,728 bytes (3.2 MiB); a `--help` startup measured 3,276,800 bytes peak RSS. These are reproducible reference measurements rather than cross-platform guarantees. Linux CI builds the stripped binary and enforces a 15 MiB upper bound to catch accidental trusted-host growth. Node and the Pi dependency tree exist only in the worker image.
+
 ## Platform behavior
 
-Private host Unix sockets work with a native Linux Docker daemon and are exercised in Linux CI. Docker Desktop for macOS cannot bind-mount the host socket through its VM, so model-backed Docker jobs fail closed there, as they do in the TypeScript implementation.
+Private host Unix sockets work with a native Linux Docker daemon and are exercised in Linux CI. Docker Desktop for macOS cannot bind-mount the host socket through its VM, so model- and capability-backed Docker jobs fail closed there.

@@ -1,8 +1,8 @@
 # Sandbox worker protocol v1
 
-The sandbox runner is the host-side seam between the trusted controller and an untrusted per-job worker. The protocol is transport-independent; a Docker adapter may carry these messages over newline-delimited JSON, while tests use the in-memory adapter.
+The sandbox runner is the host-side seam between the trusted harness and an untrusted per-job worker. The protocol is transport-independent; a Docker adapter may carry these messages over newline-delimited JSON, while tests use the in-memory adapter.
 
-The TypeScript source of truth is [`src/sandbox-protocol.ts`](../src/sandbox-protocol.ts).
+The host implementation is [`rust/docker.rs`](../rust/docker.rs); the untrusted peer is [`docker/worker/worker.mjs`](../docker/worker/worker.mjs).
 
 ## Negotiation
 
@@ -36,4 +36,4 @@ The worker must treat the deadline and output limit as hard limits. The host ada
 6. No worker event is delivered after disposal. Late status and terminal events are dropped.
 7. A worker transport exit before a terminal event is reported as `failure` with code `worker_crash`.
 
-The controller knows only `SandboxRunner` and `SandboxJob`. Process supervision, transport framing, forced termination, and container cleanup remain implementation details of the runner adapter.
+The harness knows only `JobFactory` and `JobHandle`. Process supervision, transport framing, forced termination, and container cleanup remain implementation details of the Docker adapter.

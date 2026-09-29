@@ -79,31 +79,18 @@ An agent can run `npm test` against `/workspace` inside its sandbox. It cannot r
 
 ### Sandbox manager
 
-The `SandboxRunner` interface should stay small:
+The Rust `JobFactory`/`JobHandle` interface stays small:
 
-```ts
-interface SandboxRunner {
-  create(spec: JobSandboxSpec): Promise<SandboxJob>;
+```rust
+trait JobFactory {
+    async fn create(&self, spec: JobSpec) -> Result<Arc<dyn JobHandle>>;
+    fn repositories(&self) -> Vec<String>;
 }
 
-interface JobSandboxSpec {
-  id: string;
-  workspacePath: string;
-  conversationId: string;
-  repositoryScope: string;
-  deadlineAt: Date;
-  outputLimitBytes: number;
-  events: {
-    status(message: string): Promise<void>;
-    approval?(request: SandboxApprovalRequest): Promise<string>;
-  };
-}
-
-interface SandboxJob {
-  start(prompt: string): Promise<string>;
-  steer(message: string): Promise<void>;
-  cancel(): Promise<void>;
-  dispose(): Promise<void>;
+trait JobHandle {
+    async fn run_turn(&self, prompt: &str, events: Arc<dyn JobEventPort>) -> Result<TurnResult>;
+    async fn steer(&self, message: &str) -> Result<()>;
+    async fn cancel(&self) -> Result<()>;
 }
 ```
 
@@ -111,13 +98,12 @@ Its implementation owns container or VM creation, limits, networking, workspace 
 
 ### Capability broker
 
-The capability broker exposes curated MCP tools such as:
+The capability broker exposes only these curated MCP tools:
 
 - `workspace.read_metadata`
 - `workspace.submit_patch`
-- `github.get_issue`
-- `github.create_pull_request`
-- `secrets.perform_operation`
+- `workspace.get_patch_status`
+- `workspace.apply_patch`
 
 Each call is evaluated server-side against the authenticated job identity, repository scope, normalized arguments, configured policy, call and output limits, and any required operator approval. Configuration is loaded by the trusted host and cannot be modified through Signal or by the worker. The authenticated transport, lease lifecycle, audit format, and Linux platform constraint are documented in [`capability-broker.md`](capability-broker.md).
 
@@ -152,7 +138,7 @@ MCP is the mediation protocol, not the isolation mechanism. The sandbox provides
 ## Request flow
 
 1. An allowlisted Signal sender starts a job using a configured repository alias.
-2. The controller resolves the alias; the raw host path is never accepted from chat.
+2. The harness resolves the alias; the raw host path is never accepted from chat.
 3. The workspace adapter prepares a disposable repository snapshot.
 4. The sandbox manager starts a worker with that snapshot and a per-job identity.
 5. Pi may execute arbitrary build commands only inside the worker.
@@ -160,7 +146,7 @@ MCP is the mediation protocol, not the isolation mechanism. The sandbox provides
 7. The broker denies it, allows it by policy, or asks the operator through Signal.
 8. If approved, the broker performs exactly the normalized operation and records the result.
 9. The worker submits a patch. Applying it to the host repository remains a separate policy or approval decision.
-10. Cancellation, timeout, failure, or controller shutdown revokes the job identity and destroys the worker. A successful turn may leave the job idle for a later turn in the same in-memory Pi session.
+10. Cancellation, timeout, failure, or host shutdown revokes the job identity and destroys the worker. A successful turn may leave the job idle for a later turn in the same in-memory Pi session.
 
 ## Current implementation
 
@@ -168,15 +154,4 @@ Pi, its built-in read/write/bash tools, and its in-memory session now run only i
 
 The host exposes authenticated, job-scoped broker and model-proxy Unix sockets mounted read-only into native Linux workers. The worker registers its scoped tools and proxy provider with Pi. The broker exposes only metadata, patch submission/status, and separately approved patch application; the model proxy fixes one trusted provider/model without disclosing its credential. Docker Desktop for macOS cannot forward host Unix sockets and fails both paths closed. Approvals reduce accidental tool use inside the disposable workspace; sandbox isolation—not approval—is the security seam.
 
-The trusted host is being migrated from the initial TypeScript composition to a Rust harness with transport-neutral commands and structured replies. The Rust CLI and optional Signal ingress, disposable workspace, Docker lifecycle, worker protocol, scoped capability broker, and native model proxy are operational. The Node worker remains intentional because it contains Pi; it is not part of the trusted host runtime. See [ADR 0001](adr/0001-rust-host-and-ingress-adapters.md) and [`rust-host.md`](rust-host.md).
-
-## Recommended migration order
-
-1. Define the sandbox job protocol and add a fake `SandboxRunner` for controller tests.
-2. Package a pinned worker image containing Pi and required build tools.
-3. Give every job a disposable workspace copy; remove direct host repository access from Pi.
-4. Run shell/read/write only in the worker and enforce hard resource limits.
-5. Move the MCP gateway to the trusted host and add per-job authentication and scope enforcement.
-6. Add a model proxy so provider credentials do not enter workers.
-7. Make patch export/application an explicit capability with approval and audit records.
-8. Add adversarial integration tests for path traversal, symlinks, cancellation, credential leakage, network escape, replayed approvals, and orphaned workers.
+The trusted host is one Rust binary with transport-neutral commands and structured replies. It contains the CLI and optional Signal ingress, disposable workspace manager, Docker lifecycle, scoped capability broker, and native model proxy. The legacy TypeScript host and its dependency tree have been removed. Node remains intentionally confined to the untrusted worker image because Pi is a JavaScript dependency; no Node runtime is needed on the trusted host. See [ADR 0001](adr/0001-rust-host-and-ingress-adapters.md) and [`rust-host.md`](rust-host.md).

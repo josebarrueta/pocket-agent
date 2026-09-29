@@ -49,7 +49,7 @@ impl Default for CapabilityLimits {
         Self {
             lease_lifetime: Duration::from_secs(60 * 60),
             calls_per_job: 100,
-            output_bytes: 256 * 1024,
+            output_bytes: 6 * 1024 * 1024,
         }
     }
 }

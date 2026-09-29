@@ -1,15 +1,12 @@
 # Capability broker
 
-The trusted host runs a deny-by-default MCP capability broker. It is a deep module behind two small interfaces:
+The trusted Rust host runs a deny-by-default MCP capability broker behind the small `WorkerAccessIssuer`/`WorkerLease` seam. It creates one short-lived job lease for the Docker adapter and serves authenticated MCP requests over a private Unix socket.
 
-- `CapabilityLeaseIssuer.issue(...)` creates one short-lived job lease for the sandbox adapter.
-- `CapabilityBroker.list(...)` and `call(...)` are the authenticated test surface used by the MCP transport.
-
-Capabilities are registered by trusted startup code. Workers cannot add tools or change policy. The production broker registers only the curated workspace tools documented in [`workspaces.md`](workspaces.md). Generic execution names such as `host.exec` and `*.shell` are rejected at registration.
+Workers cannot add tools or change policy. The broker exposes only the curated workspace tools documented in [`workspaces.md`](workspaces.md); there is no registration or generic host execution surface.
 
 ## Private transport
 
-The broker listens on an owner-controlled Unix-domain socket under the state directory. `DockerSandboxRunner` bind-mounts only that socket directory read-only at `/run/pocket-agent-broker` and provides the socket location, opaque lease credential, and job ID to that job. It does not publish a TCP port or enable worker network access.
+The broker listens on an owner-controlled Unix-domain socket under the state directory. The Rust Docker adapter bind-mounts only that socket directory read-only at `/run/pocket-agent-broker` and provides the socket location, opaque lease credential, and job ID to that job. It does not publish a TCP port or enable worker network access.
 
 Host Unix-socket forwarding works with native Linux Docker and is tested in Linux CI. Docker Desktop for macOS cannot connect through a bind-mounted host Unix socket (`ENOTSUP`); capability calls are therefore not supported on that platform until a VM-local relay is implemented. The worker remains networkless and fails closed.
 
@@ -29,7 +26,7 @@ For every call the broker authenticates the credential and claimed job, consumes
 
 An `ask` approval is bound to job ID, tool name, canonical normalized-argument digest, lease expiry, and a host-generated one-time nonce. Request IDs are also consumed once to reject replay or argument mutation. The broker authenticates the lease again after the asynchronous answer, so cancellation or expiry wins the race and the operation is not invoked.
 
-Cancellation, timeout, creation rollback, disposal, and controller shutdown revoke leases synchronously before container cleanup. Credentials cannot be replayed after revocation.
+Cancellation, timeout, creation rollback, disposal, and host shutdown revoke leases synchronously before container cleanup. Credentials cannot be replayed after revocation.
 
 ## Audit records
 
@@ -37,4 +34,4 @@ The broker appends NDJSON records to `stateDir/audit/capabilities.ndjson`. Recor
 
 ## Verification
 
-`test/capability-broker.test.ts` covers cross-job use, expiry, replay and mutation, scoped enumeration, approval/revocation races, generic-shell rejection, bounded output, and audit redaction. `test/docker-sandbox.integration.test.ts` verifies worker reachability and lease revocation on native Linux Docker.
+Rust unit tests cover cross-job use, expiry, replay and mutation, scoped enumeration, approval/revocation behavior, generic-shell rejection, bounded output, and audit redaction. [`tests/rust_docker.rs`](../tests/rust_docker.rs) verifies worker reachability and read-only socket mounting on native Linux Docker.

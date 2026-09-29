@@ -7,13 +7,13 @@ The trusted host owns provider credentials and executes provider adapters. A wor
 - its job ID;
 - non-secret metadata for the one configured model.
 
-No provider key, provider URL, custom header, host credential file, or ambient cloud environment is copied into the worker. `DockerSandboxRunner` revokes the model lease synchronously on cancellation, timeout, creation rollback, worker failure disposal, and normal disposal.
+No provider key, provider URL, custom header, host credential file, or ambient cloud environment is copied into the worker. The Rust Docker adapter revokes the model lease synchronously on cancellation, timeout, creation rollback, worker failure disposal, and normal disposal.
 
 ## Request path
 
 The worker registers an inline `pocket-agent-proxy` Pi provider. Its stream implementation sends Pi's normalized transcript and a small allowlist of generation options to `POST /v1/stream` over the Unix socket. The worker cannot choose a destination URL or forward headers. The host checks the bearer lease and job ID, then requires the exact provider/model fixed by trusted startup configuration.
 
-The host uses Pi AI's provider implementation with the configured API key, optional trusted base URL, retries disabled, a hard timeout, and the worker disconnect/abort signal. Events are streamed back as bounded NDJSON. Provider diagnostics are removed and provider error text is replaced with a generic error before crossing into the worker.
+The Rust host uses its native Anthropic Messages or OpenAI-compatible Chat Completions adapter with the configured API key, optional trusted base URL, retries disabled, and a hard timeout. Events are converted to the worker protocol and streamed back as bounded NDJSON. Provider diagnostics are removed and provider error text is replaced with a generic error before crossing into the worker.
 
 Docker remains `network=none`; only the host process can contact the provider. Native Linux Docker supports the private socket mount. Docker Desktop for macOS cannot forward host Unix sockets through its VM, so model access fails closed on that platform until a VM-local relay is added.
 
@@ -37,4 +37,4 @@ A disconnected worker aborts the upstream provider request. Revoked, expired, cr
 
 The host appends `stateDir/audit/models.ndjson` records containing timestamp, job ID, configured provider/model, token count, and outcome. It does not log prompts, responses, headers, URLs, credentials, or provider error bodies.
 
-`test/model-proxy.test.ts` covers authentication and scope, arbitrary URL/header rejection, limits, timeout, provider-error redaction, revocation, and streaming cancellation. The Linux Docker integration test inspects the effective worker environment and runs a real Pi turn through a fake host backend.
+Rust model-proxy tests cover authentication and scope, arbitrary destination/field rejection, limits, timeout, provider-error redaction, revocation, and event conversion. The Linux Docker integration test inspects the effective worker environment and runs a real Pi turn through a fake provider endpoint.

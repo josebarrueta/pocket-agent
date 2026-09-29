@@ -1,6 +1,6 @@
 # Disposable workspaces
 
-`DisposableWorkspaceManager` is the trusted host module that resolves a configured repository alias into per-job content. Chat and worker inputs never select a host path.
+The Rust `WorkspaceManager` is the trusted host module that resolves a configured repository alias into per-job content. Chat and worker inputs never select a host path.
 
 ## Snapshot flow
 
@@ -42,7 +42,7 @@ Before approved application, the configured repository identity is revalidated, 
 
 ## Lifecycle and recovery
 
-Each job directory has trusted metadata outside the worker-visible workspace. `dispose()` recursively removes the job directory and is idempotent. The controller disposes workspaces on cancellation, worker failure, sandbox creation failure, and daemon shutdown.
+Each job directory has trusted metadata outside the worker-visible workspace. `dispose()` recursively removes the job directory and is idempotent. The harness disposes workspaces on cancellation, worker failure, sandbox creation failure, and daemon shutdown.
 
 At startup, the daemon calls `reclaimStale()` before accepting jobs. Only directories with recognized metadata, matching validated job identity, and a creation time older than the supplied threshold are removed. Unknown directories and symbolic links are left untouched for manual inspection.
 

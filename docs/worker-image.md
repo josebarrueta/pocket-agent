@@ -58,6 +58,6 @@ Treat every update as a supply-chain change:
 2. Advance the Debian snapshot timestamp deliberately. Review package changes shown in the build log.
 3. Set an exact Pi version in `docker/worker/package.json`, run `npm install --package-lock-only --ignore-scripts --prefix docker/worker`, and verify the changed registry URLs and integrity hashes.
 4. Keep `PI_VERSION`, the smoke-test expectation, and image documentation synchronized.
-5. Run `npm run check`, build both platforms, run the hardened smoke test, inspect image history, and compare generated SBOMs before merging.
+5. Run the Rust formatting, Clippy, unit, and Docker integration checks; build both worker platforms; run the hardened smoke test; inspect image history; and compare generated SBOMs before merging.
 
 Do not copy provider credentials into the image or pass them as build arguments. Future workers receive model access through the job-scoped model proxy.
