@@ -1,0 +1,17 @@
+[package]
+name = "pocket-agent"
+version = "0.2.0"
+edition = "2024"
+rust-version = "1.85"
+description = "A transport-neutral harness for isolated coding agents"
+license = "MIT"
+
+[lib]
+path = "rust/lib.rs"
+
+[dependencies]
+anyhow = "1.0"
+async-trait = "0.1"
+serde = { version = "1.0", features = ["derive"] }
+tokio = { version = "1.44", features = ["macros", "rt-multi-thread", "sync"] }
+uuid = { version = "1.16", features = ["v4"] }

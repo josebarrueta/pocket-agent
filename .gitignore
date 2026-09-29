@@ -1,5 +1,6 @@
 node_modules/
 dist/
+target/
 config.json
 signal-cli-data/
 .env

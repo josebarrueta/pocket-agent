@@ -6,17 +6,21 @@ Pocket Agent should treat agent-generated code, shell commands, and MCP clients 
 
 ```mermaid
 flowchart LR
-    operator["Operator<br/>Signal app"]
+    operator["Operator"]
+    terminal["Local terminal"]
+    signalapp["Signal app"]
     signal["Signal service"]
+    apiclient["Future HTTP client"]
 
     subgraph host["Trusted host"]
         direction LR
 
         signalcli["signal-cli<br/>hardened container"]
+        ingress["Ingress adapters<br/>CLI | Signal | future HTTP"]
 
-        subgraph control["Pocket Agent control plane"]
-            controller["Controller<br/>jobs, steer, cancel"]
-            approvals["Approval broker<br/>Signal prompts"]
+        subgraph control["Pocket Agent harness"]
+            controller["Harness<br/>jobs, steer, cancel"]
+            approvals["Approval broker"]
             manager["Sandbox manager<br/>create, stop, destroy"]
             audit[("Policy and audit log")]
         end
@@ -49,9 +53,12 @@ flowchart LR
         pi --> mcpclient
     end
 
-    operator <-->|"encrypted messages"| signal
+    operator --> terminal --> ingress
+    operator --> signalapp <-->|"encrypted messages"| signal
     signal <-->|"outbound Signal connection"| signalcli
-    signalcli <-->|"loopback SSE and JSON-RPC"| controller
+    signalcli <-->|"loopback SSE and JSON-RPC"| ingress
+    apiclient -.->|"future authenticated HTTP"| ingress
+    ingress --> controller
 
     manager -->|"lifecycle and control channel"| pi
     workspace -->|"initial snapshot"| copy
@@ -61,6 +68,8 @@ flowchart LR
 ```
 
 ## Core rule
+
+The harness is transport-neutral. CLI, Signal, and future HTTP entry points are ingress adapters that authenticate a principal and translate requests/replies; no ingress can bypass repository aliases, approvals, job ownership, or sandbox policy.
 
 Arbitrary execution happens only inside a disposable worker sandbox. The host capability broker performs a small set of typed operations; it never provides a generic `host.exec` tool.
 
@@ -158,6 +167,8 @@ MCP is the mediation protocol, not the isolation mechanism. The sandbox provides
 Pi, its built-in read/write/bash tools, and its in-memory session now run only inside the Docker worker. The host package no longer installs Pi or exposes a host-side agent/MCP adapter. Workers receive only a disposable workspace, safe model-selection metadata, and normalized approval responses; they receive no host environment or credentials.
 
 The host exposes authenticated, job-scoped broker and model-proxy Unix sockets mounted read-only into native Linux workers. The worker registers its scoped tools and proxy provider with Pi. The broker exposes only metadata, patch submission/status, and separately approved patch application; the model proxy fixes one trusted provider/model without disclosing its credential. Docker Desktop for macOS cannot forward host Unix sockets and fails both paths closed. Approvals reduce accidental tool use inside the disposable workspace; sandbox isolation—not approval—is the security seam.
+
+The trusted host is being migrated from the initial TypeScript/Signal composition to a Rust harness with transport-neutral commands and structured replies. The Rust harness seam and scoped principal/conversation model are implemented alongside the TypeScript host while sandbox, workspace, broker, model, and ingress adapters are ported. The Node worker remains intentional because it contains Pi; it is not part of the trusted host runtime. See [ADR 0001](adr/0001-rust-host-and-ingress-adapters.md).
 
 ## Recommended migration order
 

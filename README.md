@@ -1,48 +1,29 @@
 # Pocket Agent
 
-A private Signal control plane for a coding agent running on your machine.
+A private, transport-neutral harness for a coding agent running on your machine.
 
-From Signal you can report a bug, start a Pi task in an allowlisted repository, receive progress and final output, answer questions/permission prompts, steer active work, cancel it, and switch between sessions. MCP tools are exposed through a deny-by-default gateway.
+The local CLI, Signal, and future authenticated HTTP endpoints are ingress adapters to the same job harness. An ingress can start a Pi task in an allowlisted repository, receive progress and final output, answer approvals, steer or cancel work, and switch between sessions. MCP tools are exposed through a deny-by-default gateway.
 
 > **Early MVP:** use on a development machine with backups. Pi and its built-in tools run only in a constrained disposable Docker worker. The authenticated broker exposes only scoped workspace operations, and a job-scoped host proxy keeps provider credentials out of workers.
 
-## Why Signal first?
+## Ingress adapters
 
-Signal works for a private, self-hosted workflow through the unofficial `signal-cli` daemon and does not need a public webhook. WhatsApp support fits the same `Messenger` interface, but its official Cloud API requires business setup, a public webhook, and template handling outside the 24-hour customer-service window. See [`docs/research.md`](docs/research.md).
+Signal was the first remote adapter because it supports a private, self-hosted workflow through the unofficial `signal-cli` daemon without a public webhook. It is not the harness entry point or part of the domain model. The trusted host is being migrated to Rust with a first-class local CLI; Signal will sit beside it as an optional adapter. See [ADR 0001](docs/adr/0001-rust-host-and-ingress-adapters.md).
 
 ## Target architecture
 
 ```mermaid
 flowchart LR
-    phone["Operator<br/>Signal app"] <-->|"encrypted messages"| signal["Signal service"]
-
-    subgraph trusted["Trusted host"]
-        signalcli["signal-cli<br/>hardened container"]
-        controller["Control plane<br/>jobs, approvals, cancel"]
-        manager["Sandbox manager"]
-        gateway["MCP capability broker<br/>policy and audit"]
-        model["Model proxy<br/>provider credentials"]
-        repos[("Host repositories")]
-        connectors["Credentialed connectors"]
-
-        signalcli <-->|"loopback only"| controller
-        controller --> manager
-        controller <--> gateway
-        gateway --> repos
-        gateway --> connectors
-    end
-
-    subgraph sandbox["Untrusted disposable job sandbox"]
-        pi["Pi agent runtime"]
-        shell["Shell and build tools"]
-        workspace[("Workspace copy")]
-        pi --> shell --> workspace
-    end
-
-    signal <--> signalcli
-    manager -->|"create, steer, kill"| pi
-    pi -->|"authenticated MCP only"| gateway
-    pi -->|"private endpoint"| model
+    cli["Local CLI"] --> ingress["Ingress adapters"]
+    phone["Signal app"] <--> signal["Signal service"] <--> signalcli["signal-cli"] --> ingress
+    api["Future HTTP client"] -.-> ingress
+    ingress --> harness["Harness<br/>jobs, approvals, lifecycle"]
+    harness --> manager["Sandbox manager"]
+    harness <--> gateway["Capability broker"]
+    manager --> worker["Untrusted Pi worker"]
+    worker -->|"private authenticated sockets"| gateway
+    worker --> model["Model proxy"]
+    gateway --> repos[("Host repositories")]
 ```
 
 Arbitrary agent-selected commands run only inside a disposable worker. The worker receives a repository copy, not the original host checkout, and has no host home directory, Docker socket, or long-lived credentials. Privileged actions cross an authenticated MCP seam where the trusted capability broker validates job identity, scope, normalized arguments, policy, and operator approval. The broker exposes typed capabilities and never a generic host shell.
@@ -51,9 +32,10 @@ Pi execution and built-in tools run in the isolated worker; the host package doe
 
 The deep seams are intentionally small:
 
-- `Messenger`: incoming messages and outbound text. A WhatsApp adapter can replace Signal.
-- `SandboxRunner` / `SandboxJob`: create, start, steer, cancel and dispose isolated jobs. Docker is the production adapter; VM adapters can fit the same seam.
-- `ApprovalPort`: turns blocking agent questions and tool permissions into chat requests.
+- `Harness`: accepts transport-neutral commands identified by principal and conversation and emits structured replies.
+- Ingress adapters authenticate principals and translate CLI, Signal, or future HTTP traffic at that seam.
+- `JobFactory` / `JobHandle`: create, run, steer, cancel and dispose isolated jobs without exposing Docker or workspace details to the harness.
+- `JobEventPort`: reports status and requests one-operation approvals during a turn.
 
 ## Current capabilities
 
@@ -65,12 +47,13 @@ The deep seams are intentionally small:
 - Incoming senders and repositories are host-configured allowlists.
 - Jobs use bounded disposable repository snapshots; candidate patches are exported with a changed-file manifest while the original checkout remains untouched.
 - Pi writes and shell calls default to explicit approval.
-- The prior host-side MCP extension has been removed; privileged capabilities will return through the authenticated broker.
+- Privileged host operations are available only through authenticated, job-scoped broker capabilities.
 - Signal group messages are ignored in the MVP; only allowlisted private senders are accepted.
 
 ## Prerequisites
 
-- Node.js 20.12+
+- Rust 1.85+ for the new trusted-host harness
+- Node.js 20.12+ while the TypeScript host remains during migration and for worker dependency builds
 - A digest-pinned Pocket Agent worker image built from this repository
 - Docker (recommended for `signal-cli` and MCP isolation)
 - A Signal account. Linking `signal-cli` as a secondary device is recommended.
