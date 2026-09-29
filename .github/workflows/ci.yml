@@ -75,8 +75,17 @@ jobs:
           node-version: 22.19.0
           cache: npm
       - run: npm ci
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.85.1 --profile minimal --no-self-update
       - name: Build Docker runner fixture
         run: docker build --build-arg BASE_IMAGE=pocket-agent/worker:test --file test/fixtures/docker-worker/Dockerfile --tag pocket-agent/worker-fixture:test .
+      - name: Test Rust Docker job adapter
+        env:
+          POCKET_AGENT_DOCKER_TEST_IMAGE: pocket-agent/worker:test
+          POCKET_AGENT_DOCKER_FIXTURE_IMAGE: pocket-agent/worker-fixture:test
+          POCKET_AGENT_DOCKER_PATH: /usr/bin/docker
+          POCKET_AGENT_TAR_PATH: /usr/bin/tar
+        run: cargo +1.85.1 test --locked --test rust_docker
       - name: Test Docker SandboxRunner
         env:
           POCKET_AGENT_DOCKER_TEST_IMAGE: pocket-agent/worker:test

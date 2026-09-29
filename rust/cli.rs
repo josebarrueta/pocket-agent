@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{path::PathBuf, sync::Arc};
 
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
@@ -15,6 +15,8 @@ use crate::{
 #[derive(Debug, Parser)]
 #[command(name = "pocket-agent", version, about = "Run isolated coding jobs")]
 pub struct Cli {
+    #[arg(long, env = "POCKET_AGENT_CONFIG", default_value = "config.json")]
+    pub config: PathBuf,
     #[command(subcommand)]
     pub command: CliCommand,
 }

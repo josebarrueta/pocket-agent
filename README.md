@@ -8,7 +8,7 @@ The local CLI, Signal, and future authenticated HTTP endpoints are ingress adapt
 
 ## Ingress adapters
 
-Signal was the first remote adapter because it supports a private, self-hosted workflow through the unofficial `signal-cli` daemon without a public webhook. It is not the harness entry point or part of the domain model. The trusted host is being migrated to Rust with a first-class local CLI; Signal will sit beside it as an optional adapter. See [ADR 0001](docs/adr/0001-rust-host-and-ingress-adapters.md).
+Signal was the first remote adapter because it supports a private, self-hosted workflow through the unofficial `signal-cli` daemon without a public webhook. It is not the harness entry point or part of the domain model. The trusted host is being migrated to Rust with a first-class local CLI; Signal will sit beside it as an optional adapter. See [ADR 0001](docs/adr/0001-rust-host-and-ingress-adapters.md) and [`docs/rust-host.md`](docs/rust-host.md).
 
 ## Target architecture
 
@@ -39,7 +39,17 @@ The deep seams are intentionally small:
 
 ## Current capabilities
 
-- `/new <repo> <task>` starts a persistent Pi conversation.
+The Rust host now supports a one-turn CLI and an interactive shell:
+
+```bash
+cargo run --release -- --config ./config.json run --repo app --prompt "Fix the parser"
+cargo run --release -- --config ./config.json run --repo app --bug "Parser panics on empty input"
+cargo run --release -- --config ./config.json shell --repo app
+```
+
+It uses the same hardened Docker worker, disposable workspace, and host-only model credential path. Signal currently remains on the legacy TypeScript host while its optional Rust ingress adapter is ported.
+
+- `/new <repo> <task>` starts a persistent Pi conversation through Signal.
 - `/bug <repo> <description>` asks Pi to reproduce, fix and test a bug.
 - Plain text or `/steer` continues/redirects the selected session.
 - `/answer` resolves agent questions, Pi tool approvals and MCP approvals.
@@ -123,10 +133,15 @@ Edit `config.json`:
 - `agent.apiKeyEnv`: host environment variable containing that provider's API key; its value is never passed to workers.
 - `permissions`: `allow`, `ask`, or `deny` for reads, writes, and shell calls inside the worker.
 
-Then export only the configured host credential and start the daemon:
+Then export only the configured host credential. Run the Rust CLI locally, or start the legacy Signal adapter during migration:
 
 ```bash
 export ANTHROPIC_API_KEY='...'
+
+# First-class local ingress
+cargo run --release -- --config ./config.json run --repo app --prompt "Review this repository"
+
+# Signal ingress during the Rust migration
 npm run check
 npm run dev -- ./config.json
 ```
