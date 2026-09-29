@@ -1,4 +1,6 @@
+pub mod cli;
 pub mod command;
+pub mod config;
 pub mod domain;
 pub mod harness;
 pub mod ports;
@@ -15,6 +17,7 @@ mod tests {
     use tokio::sync::{Mutex, Notify};
 
     use crate::{
+        cli::{CliCommand, CliIngress, RunArgs, Terminal},
         domain::{
             ApprovalRequest, HarnessCommand, HarnessEvent, HarnessRequest, JobKind, JobSpec,
             RequestContext, TurnResult,
@@ -99,6 +102,24 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct FakeTerminal {
+        output: Mutex<Vec<String>>,
+        input: Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl Terminal for FakeTerminal {
+        async fn write(&self, text: &str) -> Result<()> {
+            self.output.lock().await.push(text.to_owned());
+            Ok(())
+        }
+
+        async fn read(&self, _prompt: &str) -> Result<Option<String>> {
+            Ok(self.input.lock().await.pop())
+        }
+    }
+
     struct FakeFactory {
         approval: bool,
     }
@@ -135,6 +156,26 @@ mod tests {
             },
             command,
         }
+    }
+
+    #[tokio::test]
+    async fn cli_is_a_first_class_ingress_and_waits_for_completion() {
+        let harness = Harness::new(Arc::new(FakeFactory { approval: false }));
+        let terminal = Arc::new(FakeTerminal::default());
+        let cli = CliIngress::new(harness.clone(), terminal.clone(), "local-user".into());
+
+        cli.run(CliCommand::Run(RunArgs {
+            repo: "app".into(),
+            prompt: Some("fix".into()),
+            bug: None,
+        }))
+        .await
+        .unwrap();
+
+        let output = terminal.output.lock().await.join("\n");
+        assert!(output.contains("Started"));
+        assert!(output.contains("fix:done"));
+        harness.close().await;
     }
 
     #[tokio::test]
