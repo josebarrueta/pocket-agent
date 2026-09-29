@@ -2,7 +2,7 @@
 name = "pocket-agent"
 version = "0.2.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.88"
 description = "A transport-neutral harness for isolated coding agents"
 license = "MIT"
 

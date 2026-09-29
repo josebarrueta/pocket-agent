@@ -544,7 +544,7 @@ fn parse_manifest(bytes: &[u8]) -> Result<Vec<ChangedFile>> {
         .collect::<Vec<_>>();
     ensure!(fields.len() % 2 == 0, "Malformed Git change manifest");
     fields
-        .chunks_exact(2)
+        .chunks(2)
         .map(|pair| {
             let status = match pair[0] {
                 b"A" => "added",

@@ -164,19 +164,19 @@ async fn rust_worker_reaches_the_host_model_proxy_without_provider_credentials()
                 break;
             }
             request.extend_from_slice(&chunk[..read]);
-            if expected.is_none() {
-                if let Some(end) = request.windows(4).position(|window| window == b"\r\n\r\n") {
-                    let header = String::from_utf8_lossy(&request[..end]);
-                    let length = header
-                        .lines()
-                        .find_map(|line| {
-                            line.to_ascii_lowercase()
-                                .strip_prefix("content-length:")
-                                .map(|value| value.trim().parse::<usize>().unwrap())
-                        })
-                        .unwrap_or(0);
-                    expected = Some(end + 4 + length);
-                }
+            if expected.is_none()
+                && let Some(end) = request.windows(4).position(|window| window == b"\r\n\r\n")
+            {
+                let header = String::from_utf8_lossy(&request[..end]);
+                let length = header
+                    .lines()
+                    .find_map(|line| {
+                        line.to_ascii_lowercase()
+                            .strip_prefix("content-length:")
+                            .map(|value| value.trim().parse::<usize>().unwrap())
+                    })
+                    .unwrap_or(0);
+                expected = Some(end + 4 + length);
             }
             if expected.is_some_and(|length| request.len() >= length) {
                 break;

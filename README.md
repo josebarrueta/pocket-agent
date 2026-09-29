@@ -62,7 +62,7 @@ It uses the same hardened Docker worker, disposable workspace, and host-only mod
 
 ## Prerequisites
 
-- Rust 1.85+ for the new trusted-host harness
+- Rust 1.88+ for the new trusted-host harness
 - Node.js 20.12+ while the TypeScript host remains during migration and for worker dependency builds
 - A digest-pinned Pocket Agent worker image built from this repository
 - Docker (recommended for `signal-cli` and MCP isolation)

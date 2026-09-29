@@ -383,10 +383,10 @@ impl ModelProxy {
             .ok_or_else(|| anyhow!("Invalid OpenAI response"))?;
         let message = &choice["message"];
         let mut content = Vec::new();
-        if let Some(text) = message.get("content").and_then(Value::as_str) {
-            if !text.is_empty() {
-                content.push(json!({ "type": "text", "text": text }));
-            }
+        if let Some(text) = message.get("content").and_then(Value::as_str)
+            && !text.is_empty()
+        {
+            content.push(json!({ "type": "text", "text": text }));
         }
         if let Some(calls) = message.get("tool_calls").and_then(Value::as_array) {
             for call in calls {
