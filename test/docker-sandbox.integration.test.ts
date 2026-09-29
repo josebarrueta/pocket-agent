@@ -393,7 +393,7 @@ integration("Docker byte and storage limits fail closed and reclaim resources", 
     events: { status: async () => {} },
   });
   t.after(() => disk.dispose());
-  assert.equal(await disk.start("disk-pressure"), "completed disk-pressure");
+  assert.equal(await disk.start("disk-pressure"), '{"bounded":true}');
   assert.deepEqual(JSON.parse(await readFile(join(root, "disk.json"), "utf8")), { bounded: true });
   await disk.dispose();
 
