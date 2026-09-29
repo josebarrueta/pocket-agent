@@ -179,6 +179,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cli_answers_scoped_approvals() {
+        let harness = Harness::new(Arc::new(FakeFactory { approval: true }));
+        let terminal = Arc::new(FakeTerminal {
+            output: Mutex::new(Vec::new()),
+            input: Mutex::new(vec!["yes".into()]),
+        });
+        let cli = CliIngress::new(harness.clone(), terminal.clone(), "local-user".into());
+
+        cli.run(CliCommand::Run(RunArgs {
+            repo: "app".into(),
+            prompt: Some("change".into()),
+            bug: None,
+        }))
+        .await
+        .unwrap();
+
+        assert!(
+            terminal
+                .output
+                .lock()
+                .await
+                .join("\n")
+                .contains("change:yes")
+        );
+        harness.close().await;
+    }
+
+    #[tokio::test]
     async fn ingress_identity_is_independent_from_job_coordination() {
         let harness = Harness::new(Arc::new(FakeFactory { approval: false }));
         let replies = Arc::new(Replies::default());
