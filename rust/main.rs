@@ -9,12 +9,13 @@ use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use clap::Parser;
 use pocket_agent::{
+    capability::{CapabilityBroker, CapabilityLimits},
     cli::{Cli, CliIngress, Terminal},
     config::Config,
     docker::{DockerJobFactory, DockerJobFactoryConfig, DockerLimits},
     harness::Harness,
     model_proxy::{ModelDescriptor, ModelProxy, ModelProxyLimits},
-    ports::{JobFactory, WorkerAccessIssuer},
+    ports::{CombinedAccessIssuers, JobFactory, WorkerAccessIssuer},
     workspace::{WorkspaceLimits, WorkspaceManager},
 };
 
@@ -96,40 +97,53 @@ async fn run_with_proxy(cli: Cli, config: Config, proxy: Arc<ModelProxy>) -> Res
         WorkspaceLimits::default(),
     )?;
     workspaces.reclaim_all()?;
-    let access: Arc<dyn WorkerAccessIssuer> = proxy;
-    let permissions = serde_json::to_string(&config.agent.permissions)?;
-    let tar = find_tar()?;
-    let factory = Arc::new(DockerJobFactory::new(DockerJobFactoryConfig {
-        docker: config.sandbox.docker_path,
-        tar,
-        image: config.sandbox.image,
-        model: config.agent.model,
-        thinking: serde_json::to_value(config.agent.thinking)?
-            .as_str()
-            .unwrap_or("medium")
-            .to_owned(),
-        permissions,
-        limits: DockerLimits {
-            cpus: config.sandbox.cpus,
-            memory_bytes: config.sandbox.memory_bytes,
-            pids: config.sandbox.pids,
-            temporary_storage_bytes: config.sandbox.temporary_storage_bytes,
-            workspace_storage_bytes: config.sandbox.workspace_storage_bytes,
-            ..DockerLimits::default()
-        },
-        workspaces,
-        access: Some(access),
-        allow_unpinned_image_for_tests: false,
-    })?);
-    factory.reconcile().await?;
-    let job_factory: Arc<dyn JobFactory> = factory;
-    let harness = Harness::new(job_factory);
-    let principal = std::env::var("USER")
-        .or_else(|_| std::env::var("USERNAME"))
-        .unwrap_or_else(|_| "local".into());
-    let ingress = CliIngress::new(harness.clone(), Arc::new(StandardTerminal), principal);
-    let result = ingress.run(cli.command).await;
-    harness.close().await;
+    let capabilities = CapabilityBroker::new(
+        config.state_dir.join("capability-broker/broker.sock"),
+        config.state_dir.join("audit/capabilities.ndjson"),
+        workspaces.clone(),
+        CapabilityLimits::default(),
+    )?;
+    capabilities.start().await?;
+    let result = async {
+        let access: Arc<dyn WorkerAccessIssuer> =
+            Arc::new(CombinedAccessIssuers(vec![proxy, capabilities.clone()]));
+        let permissions = serde_json::to_string(&config.agent.permissions)?;
+        let tar = find_tar()?;
+        let factory = Arc::new(DockerJobFactory::new(DockerJobFactoryConfig {
+            docker: config.sandbox.docker_path,
+            tar,
+            image: config.sandbox.image,
+            model: config.agent.model,
+            thinking: serde_json::to_value(config.agent.thinking)?
+                .as_str()
+                .unwrap_or("medium")
+                .to_owned(),
+            permissions,
+            limits: DockerLimits {
+                cpus: config.sandbox.cpus,
+                memory_bytes: config.sandbox.memory_bytes,
+                pids: config.sandbox.pids,
+                temporary_storage_bytes: config.sandbox.temporary_storage_bytes,
+                workspace_storage_bytes: config.sandbox.workspace_storage_bytes,
+                ..DockerLimits::default()
+            },
+            workspaces,
+            access: Some(access),
+            allow_unpinned_image_for_tests: false,
+        })?);
+        factory.reconcile().await?;
+        let job_factory: Arc<dyn JobFactory> = factory;
+        let harness = Harness::new(job_factory);
+        let principal = std::env::var("USER")
+            .or_else(|_| std::env::var("USERNAME"))
+            .unwrap_or_else(|_| "local".into());
+        let ingress = CliIngress::new(harness.clone(), Arc::new(StandardTerminal), principal);
+        let result = ingress.run(cli.command).await;
+        harness.close().await;
+        result
+    }
+    .await;
+    capabilities.close().await;
     result
 }
 

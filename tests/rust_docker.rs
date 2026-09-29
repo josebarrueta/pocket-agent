@@ -5,6 +5,7 @@ use std::{collections::BTreeMap, path::PathBuf, sync::Arc, time::Duration};
 use anyhow::Result;
 use async_trait::async_trait;
 use pocket_agent::{
+    capability::{CapabilityBroker, CapabilityLimits},
     docker::{DockerJobFactory, DockerJobFactoryConfig, DockerLimits},
     domain::{ApprovalRequest, JobSpec},
     model_proxy::{ModelDescriptor, ModelProxy, ModelProxyLimits},
@@ -139,6 +140,78 @@ async fn rust_docker_job_runs_the_worker_and_exports_a_patch() -> Result<()> {
         )
         .is_empty()
     );
+    let _ = std::fs::remove_dir_all(root);
+    Ok(())
+}
+
+#[tokio::test]
+async fn rust_worker_reaches_only_its_scoped_capability_broker() -> Result<()> {
+    if cfg!(target_os = "macos") {
+        return Ok(());
+    }
+    let Some(image) = std::env::var_os("POCKET_AGENT_DOCKER_FIXTURE_IMAGE") else {
+        return Ok(());
+    };
+    let root = PathBuf::from("/tmp").join(format!("pa-rust-broker-{}", uuid::Uuid::new_v4()));
+    let source = root.join("source");
+    std::fs::create_dir_all(&source)?;
+    git(&source, &["init", "--quiet"]);
+    git(&source, &["config", "user.name", "Test"]);
+    git(&source, &["config", "user.email", "test@example.com"]);
+    std::fs::write(source.join("input.txt"), "baseline\n")?;
+    git(&source, &["add", "."]);
+    git(&source, &["commit", "--quiet", "-m", "baseline"]);
+    let workspaces = WorkspaceManager::new(
+        root.join("workspaces"),
+        BTreeMap::from([("app".into(), source)]),
+        WorkspaceLimits::default(),
+    )?;
+    let broker = CapabilityBroker::new(
+        root.join("broker/broker.sock"),
+        root.join("audit/capabilities.ndjson"),
+        workspaces.clone(),
+        CapabilityLimits::default(),
+    )?;
+    broker.start().await?;
+    let access: Arc<dyn WorkerAccessIssuer> = broker.clone();
+    let docker_path = PathBuf::from(
+        std::env::var_os("POCKET_AGENT_DOCKER_PATH").unwrap_or_else(|| "/usr/bin/docker".into()),
+    );
+    let factory = DockerJobFactory::new(DockerJobFactoryConfig {
+        docker: docker_path,
+        tar: PathBuf::from(
+            std::env::var_os("POCKET_AGENT_TAR_PATH").unwrap_or_else(|| "/usr/bin/tar".into()),
+        ),
+        image: image.to_string_lossy().into_owned(),
+        model: "fake/fake".into(),
+        thinking: "off".into(),
+        permissions: r#"{"read":"allow","write":"allow","bash":"allow"}"#.into(),
+        limits: DockerLimits {
+            job_timeout: Duration::from_secs(30),
+            ..DockerLimits::default()
+        },
+        workspaces,
+        access: Some(access),
+        allow_unpinned_image_for_tests: true,
+    })?;
+    let job = factory
+        .create(JobSpec {
+            job_id: format!("rust-broker-{}", std::process::id()),
+            ingress_id: "test".into(),
+            principal_id: "test".into(),
+            conversation_id: "test".into(),
+            repository: "app".into(),
+        })
+        .await?;
+    let result = job.run_turn("broker-list", Arc::new(Events)).await?;
+    assert!(
+        result
+            .changed_files
+            .iter()
+            .any(|file| file.path == "broker.json")
+    );
+    job.cancel().await?;
+    broker.close().await;
     let _ = std::fs::remove_dir_all(root);
     Ok(())
 }

@@ -278,6 +278,9 @@ impl JobHandle for DockerJob {
                 .is_ok(),
             "Docker job is already running"
         );
+        for lease in &self.leases {
+            lease.set_events(Some(events.clone()));
+        }
         let result = async {
         ensure!(
             !self.disposed.load(Ordering::SeqCst),
@@ -374,6 +377,9 @@ impl JobHandle for DockerJob {
             }
         }
         }.await;
+        for lease in &self.leases {
+            lease.set_events(None);
+        }
         self.running.store(false, Ordering::SeqCst);
         if result.is_err() {
             self.dispose().await;

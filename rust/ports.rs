@@ -32,12 +32,34 @@ pub struct PrivateMount {
 pub trait WorkerLease: Send + Sync {
     fn environment(&self) -> BTreeMap<String, String>;
     fn mounts(&self) -> Vec<PrivateMount>;
+    fn set_events(&self, _events: Option<Arc<dyn JobEventPort>>) {}
     fn revoke(&self);
 }
 
 #[async_trait]
 pub trait WorkerAccessIssuer: Send + Sync {
     async fn issue(&self, spec: &JobSpec) -> Result<Vec<Arc<dyn WorkerLease>>>;
+}
+
+pub struct CombinedAccessIssuers(pub Vec<Arc<dyn WorkerAccessIssuer>>);
+
+#[async_trait]
+impl WorkerAccessIssuer for CombinedAccessIssuers {
+    async fn issue(&self, spec: &JobSpec) -> Result<Vec<Arc<dyn WorkerLease>>> {
+        let mut leases = Vec::new();
+        for issuer in &self.0 {
+            match issuer.issue(spec).await {
+                Ok(mut issued) => leases.append(&mut issued),
+                Err(error) => {
+                    for lease in &leases {
+                        lease.revoke();
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        Ok(leases)
+    }
 }
 
 #[async_trait]

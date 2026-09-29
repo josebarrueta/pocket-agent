@@ -47,7 +47,7 @@ cargo run --release -- --config ./config.json run --repo app --bug "Parser panic
 cargo run --release -- --config ./config.json shell --repo app
 ```
 
-It uses the same hardened Docker worker, disposable workspace, and host-only model credential path. Signal currently remains on the legacy TypeScript host while its optional Rust ingress adapter is ported.
+It uses the same hardened Docker worker, disposable workspace, scoped capability broker, and host-only model credential path. Signal currently remains on the legacy TypeScript host while its optional Rust ingress adapter is ported.
 
 - `/new <repo> <task>` starts a persistent Pi conversation through Signal.
 - `/bug <repo> <description>` asks Pi to reproduce, fix and test a bug.

@@ -19,13 +19,14 @@ cargo build --release --locked
 - validated configuration; Signal settings are optional for CLI use;
 - bounded disposable Git snapshots and patch export;
 - hardened Docker job lifecycle and versioned worker protocol;
-- job-scoped Unix-socket model leases;
+- job-scoped Unix-socket capability and model leases;
+- curated workspace metadata, candidate patch, review, and approved application capabilities;
 - native Anthropic Messages and OpenAI-compatible Chat Completions adapters;
-- provider/model, destination, rate, concurrency, request-token, job-token, timeout, byte, and audit controls.
+- provider/model, destination, capability scope, replay, rate, concurrency, call, token, timeout, byte, and redacted audit controls.
 
 The provider key is read from `agent.apiKeyEnv` into the host process. The worker receives a random revocable lease, fixed model metadata, and a read-only socket-directory mount. It does not receive the provider key or provider URL.
 
-The Rust CLI currently exposes built-in worker tools and exports candidate changes; curated host workspace capabilities are still being ported. Signal continues to use the TypeScript host until its Rust adapter reaches parity. The TypeScript host will then be removed, leaving Node only in the worker image.
+The Rust CLI exposes built-in worker tools and the four curated workspace capabilities. Capability scope comes only from the authenticated job lease; no capability accepts a host path or command. Applying a submitted canonical patch requires a conversation- and job-scoped operator approval. Signal continues to use the TypeScript host until its Rust adapter reaches parity. The TypeScript host will then be removed, leaving Node only in the worker image.
 
 ## Platform behavior
 

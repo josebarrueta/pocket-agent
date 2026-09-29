@@ -5,9 +5,11 @@ use std::{
     os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
     path::{Component, Path, PathBuf},
     process::{Command, Stdio},
+    sync::{Arc, Mutex},
 };
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
+use sha2::{Digest, Sha256};
 
 use crate::domain::ChangedFile;
 
@@ -44,11 +46,31 @@ pub struct WorkspacePatch {
     pub files: Vec<ChangedFile>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WorkspacePatchStatus {
+    pub state: String,
+    pub patch_id: Option<String>,
+    pub files: Vec<ChangedFile>,
+    pub bytes: usize,
+    pub patch: Option<String>,
+    pub applied_at_unix_ms: Option<u128>,
+}
+
+#[derive(Clone)]
+struct CandidatePatch {
+    patch_id: String,
+    patch: String,
+    files: Vec<ChangedFile>,
+    applied_at_unix_ms: Option<u128>,
+}
+
 #[derive(Clone)]
 pub struct WorkspaceManager {
     root: PathBuf,
     repositories: BTreeMap<String, PathBuf>,
     limits: WorkspaceLimits,
+    candidates: Arc<Mutex<BTreeMap<String, CandidatePatch>>>,
+    capability_operations: Arc<Mutex<()>>,
 }
 
 impl WorkspaceManager {
@@ -73,6 +95,8 @@ impl WorkspaceManager {
             root,
             repositories,
             limits,
+            candidates: Arc::new(Mutex::new(BTreeMap::new())),
+            capability_operations: Arc::new(Mutex::new(())),
         })
     }
 
@@ -119,6 +143,7 @@ impl WorkspaceManager {
                 control,
                 path: workspace,
                 limits: self.limits.clone(),
+                candidates: self.candidates.clone(),
                 disposed: false,
             })
         })();
@@ -157,7 +182,222 @@ impl WorkspaceManager {
             reclaimed.push(job_id.to_owned());
         }
         reclaimed.sort();
+        let mut candidates = self.candidates.lock().expect("workspace candidate lock");
+        for job_id in &reclaimed {
+            candidates.remove(job_id);
+        }
         Ok(reclaimed)
+    }
+
+    pub fn read_metadata(&self, job_id: &str, repository: &str) -> Result<serde_json::Value> {
+        let _operation = self
+            .capability_operations
+            .lock()
+            .expect("workspace operation lock");
+        self.active_control(job_id, repository)?;
+        Ok(serde_json::json!({
+            "jobId": job_id,
+            "repositoryAlias": repository,
+            "patchLimits": {
+                "maxBytes": self.limits.max_patch_bytes,
+                "maxFiles": self.limits.max_patch_files,
+            }
+        }))
+    }
+
+    pub fn submit_patch(
+        &self,
+        job_id: &str,
+        repository: &str,
+        patch: &str,
+    ) -> Result<WorkspacePatchStatus> {
+        let _operation = self
+            .capability_operations
+            .lock()
+            .expect("workspace operation lock");
+        ensure!(
+            !patch.is_empty() && !patch.contains('\0'),
+            "Patch must be non-empty UTF-8 text"
+        );
+        ensure!(
+            patch.len() <= self.limits.max_patch_bytes,
+            "Patch exceeds {} bytes",
+            self.limits.max_patch_bytes
+        );
+        reject_unsafe_patch_directives(patch)?;
+        let control = self.active_control(job_id, repository)?;
+        reset_control_to_baseline(&control)?;
+        git_with_input(
+            &control,
+            &["apply", "--check", "--binary", "--whitespace=nowarn", "-"],
+            patch.as_bytes(),
+            64 * 1024,
+        )?;
+        git_with_input(
+            &control,
+            &["apply", "--binary", "--whitespace=nowarn", "-"],
+            patch.as_bytes(),
+            64 * 1024,
+        )?;
+        scan_control_tree(&control, &self.limits)?;
+        git(&control, &["add", "--all", "--", "."], 64 * 1024)?;
+        let manifest = git_bytes(
+            &control,
+            &[
+                "diff",
+                "--cached",
+                "--name-status",
+                "-z",
+                "--no-renames",
+                "HEAD",
+                "--",
+                ".",
+            ],
+            self.limits.max_patch_bytes + 1,
+        )?;
+        let files = parse_manifest(&manifest)?;
+        ensure!(!files.is_empty(), "Patch makes no changes");
+        ensure!(
+            files.len() <= self.limits.max_patch_files,
+            "Patch changes {} files; limit is {}",
+            files.len(),
+            self.limits.max_patch_files
+        );
+        let canonical = git_bytes(
+            &control,
+            &[
+                "diff",
+                "--cached",
+                "--binary",
+                "--full-index",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--no-renames",
+                "HEAD",
+                "--",
+                ".",
+            ],
+            self.limits.max_patch_bytes + 1,
+        )?;
+        ensure!(
+            canonical.len() <= self.limits.max_patch_bytes,
+            "Patch exceeds {} bytes",
+            self.limits.max_patch_bytes
+        );
+        let canonical = String::from_utf8(canonical).context("patch is not UTF-8")?;
+        ensure!(
+            !canonical.contains("GIT binary patch"),
+            "Binary patches are not allowed"
+        );
+        let patch_id = format!("{:x}", Sha256::digest(canonical.as_bytes()));
+        let candidate = CandidatePatch {
+            patch_id,
+            patch: canonical,
+            files,
+            applied_at_unix_ms: None,
+        };
+        let status = candidate_status(&candidate, false);
+        self.candidates
+            .lock()
+            .expect("workspace candidate lock")
+            .insert(job_id.to_owned(), candidate);
+        Ok(status)
+    }
+
+    pub fn patch_status(&self, job_id: &str, repository: &str) -> Result<WorkspacePatchStatus> {
+        let _operation = self
+            .capability_operations
+            .lock()
+            .expect("workspace operation lock");
+        self.active_control(job_id, repository)?;
+        Ok(self
+            .candidates
+            .lock()
+            .expect("workspace candidate lock")
+            .get(job_id)
+            .map_or_else(empty_candidate_status, |candidate| {
+                candidate_status(candidate, true)
+            }))
+    }
+
+    pub fn apply_patch(
+        &self,
+        job_id: &str,
+        repository: &str,
+        patch_id: &str,
+    ) -> Result<WorkspacePatchStatus> {
+        let _operation = self
+            .capability_operations
+            .lock()
+            .expect("workspace operation lock");
+        self.active_control(job_id, repository)?;
+        let candidate = self
+            .candidates
+            .lock()
+            .expect("workspace candidate lock")
+            .get(job_id)
+            .cloned()
+            .ok_or_else(|| anyhow!("Unknown or stale patch ID"))?;
+        ensure!(candidate.patch_id == patch_id, "Unknown or stale patch ID");
+        if candidate.applied_at_unix_ms.is_some() {
+            return Ok(candidate_status(&candidate, false));
+        }
+        let configured = self
+            .repositories
+            .get(repository)
+            .ok_or_else(|| anyhow!("Unknown repository alias"))?;
+        let source = validate_repository(configured)?;
+        ensure!(
+            source == configured.canonicalize()?,
+            "Configured repository identity changed"
+        );
+        repository_files(&source, &self.limits)?;
+        assert_safe_target_paths(&source, &candidate.files)?;
+        git_with_input(
+            &source,
+            &["apply", "--check", "--binary", "--whitespace=nowarn", "-"],
+            candidate.patch.as_bytes(),
+            64 * 1024,
+        )?;
+        git_with_input(
+            &source,
+            &["apply", "--binary", "--whitespace=nowarn", "-"],
+            candidate.patch.as_bytes(),
+            64 * 1024,
+        )?;
+        let mut candidates = self.candidates.lock().expect("workspace candidate lock");
+        let stored = candidates
+            .get_mut(job_id)
+            .ok_or_else(|| anyhow!("Unknown or stale patch ID"))?;
+        ensure!(
+            stored.patch_id == patch_id && stored.applied_at_unix_ms.is_none(),
+            "Unknown or stale patch ID"
+        );
+        stored.applied_at_unix_ms = Some(now_unix_ms()?);
+        Ok(candidate_status(stored, false))
+    }
+
+    fn active_control(&self, job_id: &str, repository: &str) -> Result<PathBuf> {
+        validate_job_id(job_id)?;
+        ensure!(
+            self.repositories.contains_key(repository),
+            "Unknown repository alias"
+        );
+        let job_root = self.root.join(format!("job-{job_id}"));
+        let metadata = fs::symlink_metadata(&job_root)?;
+        ensure!(
+            metadata.file_type().is_dir() && !metadata.file_type().is_symlink(),
+            "No active workspace matches this capability lease"
+        );
+        let value: serde_json::Value =
+            serde_json::from_slice(&fs::read(job_root.join("workspace.json"))?)?;
+        ensure!(
+            value["version"] == 1
+                && value["jobId"] == job_id
+                && value["repositoryAlias"] == repository,
+            "No active workspace matches this capability lease"
+        );
+        Ok(job_root.join("control"))
     }
 }
 
@@ -168,6 +408,7 @@ pub struct DisposableWorkspace {
     control: PathBuf,
     pub path: PathBuf,
     limits: WorkspaceLimits,
+    candidates: Arc<Mutex<BTreeMap<String, CandidatePatch>>>,
     disposed: bool,
 }
 
@@ -237,6 +478,10 @@ impl DisposableWorkspace {
             return Ok(());
         }
         self.disposed = true;
+        self.candidates
+            .lock()
+            .expect("workspace candidate lock")
+            .remove(&self.job_id);
         if self.root.exists() {
             fs::remove_dir_all(&self.root)?;
         }
@@ -248,6 +493,39 @@ impl Drop for DisposableWorkspace {
     fn drop(&mut self) {
         let _ = self.dispose();
     }
+}
+
+fn empty_candidate_status() -> WorkspacePatchStatus {
+    WorkspacePatchStatus {
+        state: "none".into(),
+        patch_id: None,
+        files: Vec::new(),
+        bytes: 0,
+        patch: None,
+        applied_at_unix_ms: None,
+    }
+}
+
+fn candidate_status(candidate: &CandidatePatch, include_patch: bool) -> WorkspacePatchStatus {
+    WorkspacePatchStatus {
+        state: if candidate.applied_at_unix_ms.is_some() {
+            "applied"
+        } else {
+            "submitted"
+        }
+        .into(),
+        patch_id: Some(candidate.patch_id.clone()),
+        files: candidate.files.clone(),
+        bytes: candidate.patch.len(),
+        patch: include_patch.then(|| candidate.patch.clone()),
+        applied_at_unix_ms: candidate.applied_at_unix_ms,
+    }
+}
+
+fn now_unix_ms() -> Result<u128> {
+    Ok(std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_millis())
 }
 
 #[derive(Clone)]
@@ -435,6 +713,109 @@ fn scan_directory(
     Ok(())
 }
 
+fn scan_control_tree(root: &Path, limits: &WorkspaceLimits) -> Result<Vec<ScannedFile>> {
+    let mut files = Vec::new();
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        if entry.file_name() == ".git" {
+            continue;
+        }
+        let metadata = fs::symlink_metadata(entry.path())?;
+        ensure!(
+            !metadata.file_type().is_symlink(),
+            "Workspace contains a link"
+        );
+        if metadata.file_type().is_dir() {
+            scan_directory(root, &entry.path(), limits, &mut files)?;
+        } else {
+            ensure!(
+                metadata.file_type().is_file() && metadata.nlink() == 1,
+                "Workspace contains a linked or special file"
+            );
+            ensure!(
+                metadata.len() <= limits.max_file_bytes,
+                "Workspace file exceeds size limit"
+            );
+            files.push(ScannedFile {
+                path: PathBuf::from(entry.file_name()),
+                mode: metadata.mode() & 0o777,
+                size: metadata.len(),
+            });
+        }
+    }
+    ensure!(
+        files.len() <= limits.max_files,
+        "Workspace exceeds {} files",
+        limits.max_files
+    );
+    let bytes = files.iter().try_fold(0u64, |sum, file| {
+        sum.checked_add(file.size)
+            .ok_or_else(|| anyhow!("Workspace size overflow"))
+    })?;
+    ensure!(
+        bytes <= limits.max_bytes,
+        "Workspace exceeds {} bytes",
+        limits.max_bytes
+    );
+    Ok(files)
+}
+
+fn assert_safe_target_paths(root: &Path, files: &[ChangedFile]) -> Result<()> {
+    for file in files {
+        let relative = validate_relative(Path::new(&file.path))?;
+        let mut current = root.to_owned();
+        let count = relative.components().count();
+        for (index, component) in relative.components().enumerate() {
+            current.push(component);
+            let metadata = match fs::symlink_metadata(&current) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+                Err(error) => return Err(error.into()),
+            };
+            ensure!(
+                !metadata.file_type().is_symlink(),
+                "Symbolic links are not allowed in patch targets: {}",
+                file.path
+            );
+            if index + 1 < count {
+                ensure!(
+                    metadata.file_type().is_dir(),
+                    "Patch target parent is not a directory: {}",
+                    file.path
+                );
+            } else if !metadata.file_type().is_dir() {
+                ensure!(
+                    metadata.file_type().is_file() && metadata.nlink() == 1,
+                    "Patch target is not a regular file: {}",
+                    file.path
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn reject_unsafe_patch_directives(patch: &str) -> Result<()> {
+    for line in patch.lines() {
+        ensure!(
+            !(line.starts_with("rename from ")
+                || line.starts_with("rename to ")
+                || line.starts_with("copy from ")
+                || line.starts_with("copy to ")
+                || line.starts_with("similarity index ")),
+            "Patch renames and copies are not supported"
+        );
+        ensure!(
+            !matches!(
+                line,
+                "new file mode 160000" | "old mode 160000" | "deleted file mode 160000"
+            ),
+            "Patch submodules are not supported"
+        );
+    }
+    Ok(())
+}
+
 fn validate_relative(path: &Path) -> Result<PathBuf> {
     ensure!(
         !path.as_os_str().is_empty() && !path.is_absolute(),
@@ -444,6 +825,12 @@ fn validate_relative(path: &Path) -> Result<PathBuf> {
         ensure!(
             matches!(component, Component::Normal(_)),
             "Invalid workspace path {}",
+            path.display()
+        );
+        let name = component.as_os_str();
+        ensure!(
+            name != ".git" && name != ".gitmodules",
+            "Repository metadata path is not allowed: {}",
             path.display()
         );
     }
@@ -496,9 +883,14 @@ fn copy_files(
     Ok(())
 }
 
-fn reset_control(control: &Path) -> Result<()> {
+fn reset_control_to_baseline(control: &Path) -> Result<()> {
     git(control, &["reset", "--hard", "--quiet", "HEAD"], 64 * 1024)?;
     git(control, &["clean", "-dffx", "-q"], 64 * 1024)?;
+    Ok(())
+}
+
+fn reset_control(control: &Path) -> Result<()> {
+    reset_control_to_baseline(control)?;
     for entry in fs::read_dir(control)? {
         let entry = entry?;
         if entry.file_name() == ".git" {
@@ -566,15 +958,77 @@ fn git(directory: &Path, arguments: &[&str], max_bytes: usize) -> Result<()> {
     git_bytes(directory, arguments, max_bytes).map(|_| ())
 }
 
-fn git_bytes(directory: &Path, arguments: &[&str], max_bytes: usize) -> Result<Vec<u8>> {
-    let mut child = Command::new("git")
+fn git_with_input(
+    directory: &Path,
+    arguments: &[&str],
+    input: &[u8],
+    max_bytes: usize,
+) -> Result<Vec<u8>> {
+    let mut child = git_command(directory, arguments)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let mut stdin = child.stdin.take().expect("piped stdin");
+    let input = input.to_vec();
+    let writer = std::thread::spawn(move || stdin.write_all(&input));
+    let stderr_pipe = child.stderr.take().expect("piped stderr");
+    let stderr_reader = std::thread::spawn(move || drain_bounded(stderr_pipe, 64 * 1024));
+    let mut stdout = Vec::new();
+    child
+        .stdout
+        .take()
+        .expect("piped stdout")
+        .take((max_bytes + 1) as u64)
+        .read_to_end(&mut stdout)?;
+    if stdout.len() > max_bytes {
+        let _ = child.kill();
+    }
+    let status = child.wait()?;
+    writer
+        .join()
+        .map_err(|_| anyhow!("Git stdin writer failed"))??;
+    let stderr = stderr_reader
+        .join()
+        .map_err(|_| anyhow!("Git stderr reader failed"))?;
+    ensure!(
+        stdout.len() <= max_bytes,
+        "Git output exceeds {max_bytes} bytes"
+    );
+    if !status.success() {
+        bail!(
+            "git {} failed: {}",
+            arguments.join(" "),
+            String::from_utf8_lossy(&stderr).trim()
+        );
+    }
+    Ok(stdout)
+}
+
+fn git_command(directory: &Path, arguments: &[&str]) -> Command {
+    let mut command = Command::new("git");
+    command
+        .args([
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "credential.helper=",
+        ])
         .args(arguments)
+        .current_dir(directory)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_TERMINAL_PROMPT", "0");
+    command
+}
+
+fn git_bytes(directory: &Path, arguments: &[&str], max_bytes: usize) -> Result<Vec<u8>> {
+    let mut child = git_command(directory, arguments)
         .current_dir(directory)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_TERMINAL_PROMPT", "0")
         .spawn()?;
     let stderr_pipe = child.stderr.take().expect("piped stderr");
     let stderr_reader = std::thread::spawn(move || drain_bounded(stderr_pipe, 64 * 1024));
@@ -721,6 +1175,30 @@ mod tests {
     }
 
     #[test]
+    fn submits_reviews_and_applies_only_the_bound_candidate() {
+        let (root, source, manager) = fixture();
+        let mut workspace = manager.create("capability", "app").unwrap();
+        let patch = "diff --git a/tracked.txt b/tracked.txt\n--- a/tracked.txt\n+++ b/tracked.txt\n@@ -1 +1 @@\n-baseline\n+approved\n";
+        let submitted = manager.submit_patch("capability", "app", patch).unwrap();
+        assert_eq!(submitted.state, "submitted");
+        assert!(submitted.patch.is_none());
+        let status = manager.patch_status("capability", "app").unwrap();
+        assert!(status.patch.as_deref().unwrap().contains("diff --git"));
+        assert!(manager.apply_patch("capability", "app", "0").is_err());
+        let applied = manager
+            .apply_patch("capability", "app", submitted.patch_id.as_deref().unwrap())
+            .unwrap();
+        assert_eq!(applied.state, "applied");
+        assert_eq!(
+            fs::read_to_string(source.join("tracked.txt")).unwrap(),
+            "approved\n"
+        );
+        workspace.dispose().unwrap();
+        assert!(manager.patch_status("capability", "app").is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn rejects_unknown_repositories_links_hardlinks_and_submodules() {
         let (root, source, manager) = fixture();
         assert!(manager.create("job", "other").is_err());
@@ -731,6 +1209,9 @@ mod tests {
         let _ = fs::remove_file(source.join("link"));
         fs::hard_link(source.join("tracked.txt"), source.join("hard")).unwrap();
         assert!(manager.create("hardlink", "app").is_err());
+        fs::remove_file(source.join("hard")).unwrap();
+        fs::write(source.join(".gitmodules"), "[submodule \"unsafe\"]\n").unwrap();
+        assert!(manager.create("submodule", "app").is_err());
         let _ = fs::remove_dir_all(root);
     }
 
