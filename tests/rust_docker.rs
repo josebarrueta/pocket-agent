@@ -17,6 +17,11 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 struct Events;
 
+fn docker_test_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
 #[async_trait]
 impl JobEventPort for Events {
     async fn status(&self, _message: &str) -> Result<()> {
@@ -53,6 +58,7 @@ fn docker(path: &std::path::Path, arguments: &[&str]) -> String {
 
 #[tokio::test]
 async fn rust_docker_job_runs_the_worker_and_exports_a_patch() -> Result<()> {
+    let _guard = docker_test_lock().lock().await;
     let Some(image) = std::env::var_os("POCKET_AGENT_DOCKER_FIXTURE_IMAGE") else {
         return Ok(());
     };
@@ -146,6 +152,7 @@ async fn rust_docker_job_runs_the_worker_and_exports_a_patch() -> Result<()> {
 
 #[tokio::test]
 async fn rust_worker_reaches_only_its_scoped_capability_broker() -> Result<()> {
+    let _guard = docker_test_lock().lock().await;
     if cfg!(target_os = "macos") {
         return Ok(());
     }
@@ -218,6 +225,7 @@ async fn rust_worker_reaches_only_its_scoped_capability_broker() -> Result<()> {
 
 #[tokio::test]
 async fn rust_worker_reaches_the_host_model_proxy_without_provider_credentials() -> Result<()> {
+    let _guard = docker_test_lock().lock().await;
     if cfg!(target_os = "macos") {
         return Ok(());
     }
@@ -354,6 +362,278 @@ async fn rust_worker_reaches_the_host_model_proxy_without_provider_credentials()
     assert_eq!(result.output, "proxy works");
     job.cancel().await?;
     proxy.close().await;
+    let _ = std::fs::remove_dir_all(root);
+    Ok(())
+}
+
+fn fixture_factory(
+    root: &std::path::Path,
+    image: &std::ffi::OsStr,
+    limits: DockerLimits,
+) -> Result<(DockerJobFactory, PathBuf)> {
+    let source = root.join("source");
+    std::fs::create_dir_all(&source)?;
+    git(&source, &["init", "--quiet"]);
+    git(&source, &["config", "user.name", "Test"]);
+    git(&source, &["config", "user.email", "test@example.com"]);
+    std::fs::write(source.join("input.txt"), "baseline\n")?;
+    git(&source, &["add", "."]);
+    git(&source, &["commit", "--quiet", "-m", "baseline"]);
+    let workspaces = WorkspaceManager::new(
+        root.join("workspaces"),
+        BTreeMap::from([("app".into(), source)]),
+        WorkspaceLimits::default(),
+    )?;
+    let docker_path = PathBuf::from(
+        std::env::var_os("POCKET_AGENT_DOCKER_PATH").unwrap_or_else(|| "/usr/bin/docker".into()),
+    );
+    Ok((
+        DockerJobFactory::new(DockerJobFactoryConfig {
+            docker: docker_path.clone(),
+            tar: PathBuf::from(
+                std::env::var_os("POCKET_AGENT_TAR_PATH").unwrap_or_else(|| "/usr/bin/tar".into()),
+            ),
+            image: image.to_string_lossy().into_owned(),
+            model: "fake/fake".into(),
+            thinking: "off".into(),
+            permissions: r#"{"read":"allow","write":"allow","bash":"allow"}"#.into(),
+            limits,
+            workspaces,
+            access: None,
+            allow_unpinned_image_for_tests: true,
+        })?,
+        docker_path,
+    ))
+}
+
+async fn fixture_job(
+    factory: &DockerJobFactory,
+    prefix: &str,
+) -> Result<Arc<dyn pocket_agent::ports::JobHandle>> {
+    factory
+        .create(JobSpec {
+            job_id: format!("{prefix}-{}", uuid::Uuid::new_v4().simple()),
+            ingress_id: "test".into(),
+            principal_id: "test".into(),
+            conversation_id: "test".into(),
+            repository: "app".into(),
+        })
+        .await
+}
+
+fn base64url(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut output = String::new();
+    for chunk in bytes.chunks(3) {
+        let value = u32::from(chunk[0]) << 16
+            | u32::from(chunk.get(1).copied().unwrap_or(0)) << 8
+            | u32::from(chunk.get(2).copied().unwrap_or(0));
+        output.push(TABLE[((value >> 18) & 63) as usize] as char);
+        output.push(TABLE[((value >> 12) & 63) as usize] as char);
+        if chunk.len() > 1 {
+            output.push(TABLE[((value >> 6) & 63) as usize] as char);
+        }
+        if chunk.len() > 2 {
+            output.push(TABLE[(value & 63) as usize] as char);
+        }
+    }
+    output
+}
+
+async fn wait_for_missing(docker_path: &std::path::Path, kind: &str, id: &str) {
+    for _ in 0..50 {
+        if !std::process::Command::new(docker_path)
+            .args([kind, "inspect", id])
+            .output()
+            .unwrap()
+            .status
+            .success()
+        {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("Docker object {id} was not reclaimed");
+}
+
+#[tokio::test]
+async fn rust_worker_cannot_reach_host_files_ports_internet_secrets_or_docker() -> Result<()> {
+    let _guard = docker_test_lock().lock().await;
+    let Some(image) = std::env::var_os("POCKET_AGENT_DOCKER_FIXTURE_IMAGE") else {
+        return Ok(());
+    };
+    let root = PathBuf::from("/tmp").join(format!("pa-boundary-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&root)?;
+    let sibling = root.join("sibling-secret");
+    let signal_key = root.join("signal-key");
+    let credential = root.join("credential-store");
+    std::fs::write(&sibling, "sibling-only")?;
+    std::fs::write(&signal_key, "signal-only")?;
+    std::fs::write(&credential, "credential-only")?;
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await?;
+    let port = listener.local_addr()?.port();
+    let listener_task = tokio::spawn(async move {
+        let _ = listener.accept().await;
+    });
+    let (factory, _) = fixture_factory(&root, &image, DockerLimits::default())?;
+    let job = fixture_job(&factory, "boundary").await?;
+    let payload = serde_json::to_vec(&json!({
+        "paths": [sibling, signal_key, credential, "/var/run/docker.sock"],
+        "hostPort": port,
+    }))?;
+    let result = job
+        .run_turn(
+            &format!("probe-boundary:{}", base64url(&payload)),
+            Arc::new(Events),
+        )
+        .await?;
+    let boundary: serde_json::Value = serde_json::from_str(&result.output)?;
+    assert_eq!(boundary["readablePaths"], json!([]));
+    assert_eq!(boundary["inheritedSecrets"], json!([]));
+    assert_eq!(boundary["internetReachable"], false);
+    assert_eq!(boundary["hostPortReachable"], false);
+    job.cancel().await?;
+    listener_task.abort();
+    let _ = std::fs::remove_dir_all(root);
+    Ok(())
+}
+
+#[tokio::test]
+async fn rust_docker_bounds_crashes_deadlines_and_ignored_cancellation() -> Result<()> {
+    let _guard = docker_test_lock().lock().await;
+    let Some(image) = std::env::var_os("POCKET_AGENT_DOCKER_FIXTURE_IMAGE") else {
+        return Ok(());
+    };
+    let root = PathBuf::from("/tmp").join(format!("pa-lifecycle-{}", uuid::Uuid::new_v4()));
+    let (factory, docker_path) = fixture_factory(
+        &root,
+        &image,
+        DockerLimits {
+            job_timeout: Duration::from_secs(1),
+            ..DockerLimits::default()
+        },
+    )?;
+    let crashing = fixture_job(&factory, "crash").await?;
+    assert!(crashing.run_turn("crash", Arc::new(Events)).await.is_err());
+
+    let hanging = fixture_job(&factory, "timeout").await?;
+    assert!(hanging.run_turn("hang", Arc::new(Events)).await.is_err());
+
+    let cancelled = fixture_job(&factory, "cancel").await?;
+    let running = cancelled.clone();
+    let turn =
+        tokio::spawn(async move { running.run_turn("ignore-cancel", Arc::new(Events)).await });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    cancelled.cancel().await?;
+    assert!(turn.await?.is_err());
+    assert!(
+        docker(
+            &docker_path,
+            &[
+                "ps",
+                "--all",
+                "--quiet",
+                "--filter",
+                "label=pocket-agent.managed=true"
+            ]
+        )
+        .is_empty()
+    );
+    let _ = std::fs::remove_dir_all(root);
+    Ok(())
+}
+
+#[tokio::test]
+async fn rust_docker_contains_storage_process_and_memory_pressure() -> Result<()> {
+    let _guard = docker_test_lock().lock().await;
+    let Some(image) = std::env::var_os("POCKET_AGENT_DOCKER_FIXTURE_IMAGE") else {
+        return Ok(());
+    };
+    let root = PathBuf::from("/tmp").join(format!("pa-pressure-{}", uuid::Uuid::new_v4()));
+    let (storage_factory, _) = fixture_factory(
+        &root.join("storage"),
+        &image,
+        DockerLimits {
+            temporary_storage_bytes: 8 * 1024 * 1024,
+            workspace_storage_bytes: 16 * 1024 * 1024,
+            job_timeout: Duration::from_secs(30),
+            ..DockerLimits::default()
+        },
+    )?;
+    let disk = fixture_job(&storage_factory, "disk").await?;
+    let output = disk.run_turn("disk-pressure", Arc::new(Events)).await?;
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&output.output)?["bounded"],
+        true
+    );
+    disk.cancel().await?;
+
+    let (pressure_factory, _) = fixture_factory(
+        &root.join("kernel"),
+        &image,
+        DockerLimits {
+            pids: 32,
+            memory_bytes: 128 * 1024 * 1024,
+            job_timeout: Duration::from_secs(30),
+            ..DockerLimits::default()
+        },
+    )?;
+    let forked = fixture_job(&pressure_factory, "fork").await?;
+    assert!(
+        forked
+            .run_turn("fork-pressure", Arc::new(Events))
+            .await
+            .is_err()
+    );
+    let memory = fixture_job(&pressure_factory, "memory").await?;
+    assert!(
+        memory
+            .run_turn("memory-pressure", Arc::new(Events))
+            .await
+            .is_err()
+    );
+    let _ = std::fs::remove_dir_all(root);
+    Ok(())
+}
+
+#[tokio::test]
+async fn rust_docker_reconciles_labeled_orphans() -> Result<()> {
+    let _guard = docker_test_lock().lock().await;
+    let Some(image) = std::env::var_os("POCKET_AGENT_DOCKER_TEST_IMAGE") else {
+        return Ok(());
+    };
+    let root = PathBuf::from("/tmp").join(format!("pa-reconcile-{}", uuid::Uuid::new_v4()));
+    let (factory, docker_path) = fixture_factory(&root, &image, DockerLimits::default())?;
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let volume = format!("pocket-agent-rust-orphan-{suffix}");
+    let container = format!("pocket-agent-rust-orphan-{suffix}");
+    docker(
+        &docker_path,
+        &[
+            "volume",
+            "create",
+            "--label",
+            "pocket-agent.managed=true",
+            &volume,
+        ],
+    );
+    docker(
+        &docker_path,
+        &[
+            "create",
+            "--name",
+            &container,
+            "--label",
+            "pocket-agent.managed=true",
+            "--mount",
+            &format!("type=volume,src={volume},dst=/workspace"),
+            &image.to_string_lossy(),
+            "--smoke-test",
+        ],
+    );
+    factory.reconcile().await?;
+    wait_for_missing(&docker_path, "container", &container).await;
+    wait_for_missing(&docker_path, "volume", &volume).await;
     let _ = std::fs::remove_dir_all(root);
     Ok(())
 }

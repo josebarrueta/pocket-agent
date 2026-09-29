@@ -114,18 +114,23 @@ for await (const line of lines) {
       socket.once("connect", () => done(true));
       socket.once("error", () => done(false));
     });
-    await writeFile("/workspace/boundary.json", JSON.stringify({
+    const boundary = {
       readablePaths,
       inheritedSecrets: Object.keys(process.env).filter((key) => key.startsWith("POCKET_AGENT_HOST_")),
       internetReachable: await connect("1.1.1.1", 53),
       hostPortReachable: await connect("172.17.0.1", probe.hostPort),
-    }));
+    };
+    await writeFile("/workspace/boundary.json", JSON.stringify(boundary));
+    send({ protocolVersion: 1, type: "completion", jobId: message.jobId, runId: message.runId, output: JSON.stringify(boundary) });
+    continue;
   }
   if (message.prompt === "disk-pressure") {
     let bounded = false;
     try { await writeFile("/workspace/fill", Buffer.alloc(32 * 1024 * 1024, 1)); } catch (error) { bounded = error?.code === "ENOSPC"; }
     await rm("/workspace/fill", { force: true });
     await writeFile("/workspace/disk.json", JSON.stringify({ bounded }));
+    send({ protocolVersion: 1, type: "completion", jobId: message.jobId, runId: message.runId, output: JSON.stringify({ bounded }) });
+    continue;
   }
   if (message.prompt === "fork-pressure") {
     for (let index = 0; index < 256; index += 1) {
