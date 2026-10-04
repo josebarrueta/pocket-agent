@@ -356,8 +356,7 @@ impl ArcadeGatewayProvider {
             .ok_or_else(|| anyhow!("No active local turn can authorize Arcade"))?;
         events
             .status(&format!(
-                "Arcade authorization required. Open this URL in your browser:\n{}",
-                authorization_url
+                "Arcade authorization required. Open this URL in your browser:\n{authorization_url}"
             ))
             .await?;
         let code = timeout(
