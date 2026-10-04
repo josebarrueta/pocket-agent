@@ -2,11 +2,11 @@
 
 The adversarial suite treats the Rust `DockerJobFactory`, `CapabilityBroker`, `ModelProxy`, and `WorkspaceManager` as the public security seams. Tests use malicious worker behavior rather than mocking Docker internals.
 
-Native Linux is required for private host Unix-socket tests. GitHub Actions runs the full matrix on `ubuntu-latest`; Docker Desktop for macOS intentionally skips socket forwarding because its daemon runs in a VM. Unit tests and non-socket checks remain portable.
+Native Linux is required for Docker private host Unix-socket tests. GitHub Actions runs that matrix on `ubuntu-latest`; Docker Desktop for macOS intentionally skips socket forwarding because its daemon runs in a VM. On macOS, `tests/rust_native.rs` exercises the Seatbelt runner's disposable workspace, host-file and internet denial, and capability socket access. Other unit tests remain portable.
 
 | Architecture invariant / attack | Automated evidence |
 | --- | --- |
-| Agent-selected shell, read, write, and Pi execution remain outside the host process | Worker image smoke/protocol checks; real-worker Docker tests; the Rust host has no Pi dependency |
+| Agent-selected shell, read, write, and Pi execution remain outside the host process | Worker image smoke/protocol checks; Docker and native macOS worker tests; the Rust host has no Pi dependency |
 | Image is pinned, read-only, non-root, capability-free, and `no-new-privileges` | Rust config tests; Docker inspection in `tests/rust_docker.rs`; CI multi-platform build and hardened smoke test |
 | No host home, sibling repository, Signal key, credential store, original checkout, or Docker socket is available | Active boundary probe in `rust_worker_cannot_reach_host_files_ports_internet_secrets_or_docker`; workspace scanner tests; inspected mount allowlist |
 | Only a disposable workspace and bounded temporary storage are writable | Docker mount inspection; disk-pressure integration test; workspace cleanup tests |

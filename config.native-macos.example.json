@@ -1,0 +1,26 @@
+{
+  "repositories": {
+    "pocket-agent": "/Users/you/code/pocket-agent",
+    "website": "/Users/you/code/website"
+  },
+  "stateDir": "~/.local/share/pocket-agent",
+  "sandbox": {
+    "runner": "native",
+    "nodePath": "/opt/homebrew/bin/node",
+    "workerPath": "/Users/you/code/pocket-agent/docker/worker/worker.mjs"
+  },
+  "agent": {
+    "model": "anthropic/claude-sonnet-4-5",
+    "apiKeyEnv": "ANTHROPIC_API_KEY",
+    "modelRequestTimeoutMs": 120000,
+    "modelMaxRequestsPerMinute": 10,
+    "modelMaxTokensPerRequest": 32000,
+    "modelMaxTokensPerJob": 200000,
+    "thinking": "medium",
+    "permissions": {
+      "read": "allow",
+      "write": "ask",
+      "bash": "ask"
+    }
+  }
+}

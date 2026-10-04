@@ -1,6 +1,6 @@
 # Target architecture: isolated workers and a capability broker
 
-Pocket Agent should treat agent-generated code, shell commands, and MCP clients as untrusted. The trusted control plane may coordinate work, but it must not execute agent-selected commands or expose the host filesystem directly.
+Pocket Agent is a secure remote wrapper around replaceable coding agents, not an agent framework. It treats prompts, repository content, model output, agent-generated code, shell commands, agent runtimes, and MCP clients as untrusted. The trusted control plane may coordinate work, but it must not execute agent-selected commands or expose the host filesystem directly. Product boundaries and feature admission rules are defined in the [`architectural review`](architectural-review.md) and [ADR 0002](adr/0002-secure-wrapper-not-agent-framework.md).
 
 ## System diagram
 
@@ -98,14 +98,16 @@ Its implementation owns container or VM creation, limits, networking, workspace 
 
 ### Capability broker
 
-The capability broker exposes only these curated MCP tools:
+The capability broker always exposes four curated workspace tools:
 
 - `workspace.read_metadata`
 - `workspace.submit_patch`
 - `workspace.get_patch_status`
 - `workspace.apply_patch`
 
-Each call is evaluated server-side against the authenticated job identity, repository scope, normalized arguments, configured policy, call and output limits, and any required operator approval. Configuration is loaded by the trusted host and cannot be modified through Signal or by the worker. The authenticated transport, lease lifecycle, audit format, and Linux platform constraint are documented in [`capability-broker.md`](capability-broker.md).
+It may also expose a trusted configuration's exact Arcade capability allowlist through the host-side provider seam. Arcade discovery cannot add tools, and remote ingress receives none in the initial local-only implementation.
+
+Each call is evaluated server-side against the authenticated job identity, repository scope, normalized arguments, configured policy, call and output limits, and any required operator approval. Configuration is loaded by the trusted host and cannot be modified through an ingress or by the worker. The authenticated transport, lease lifecycle, audit format, and runner constraints are documented in [`capability-broker.md`](capability-broker.md).
 
 Approvals authorize one normalized operation, not a tool forever. An approval record binds the job ID, tool name, canonical argument digest, lease expiry, and a one-time request nonce. The broker re-authenticates after the answer, so cancellation or expiry wins approval races. Cancellation revokes outstanding approvals and the job's broker lease.
 
@@ -117,23 +119,23 @@ This avoids giving compromised worker code a path to unrelated repositories, hos
 
 ### Model proxy
 
-The worker reaches a narrow host proxy over a private Unix socket and never receives provider credentials. The proxy binds requests to a job, fixes the configured provider/model and destination, applies concurrency, token, rate, byte, and timeout limits, redacts operational records, and revokes access with the sandbox. Details are in [`model-proxy.md`](model-proxy.md). Workers retain `network=none`; the broker and model proxy are explicit socket mounts, not general egress.
+The worker reaches a narrow host proxy over a private Unix socket and never receives provider credentials. The proxy binds requests to a job, fixes the configured provider/model and destination, applies concurrency, token, rate, byte, and timeout limits, redacts operational records, and revokes access with the sandbox. Details are in [`model-proxy.md`](model-proxy.md). Docker workers retain `network=none`, and native workers use deny-by-default network policy; the broker and model proxy are explicit private endpoints, not general egress.
 
 ## Sandbox invariants
 
-A job worker should have:
+Every job worker must have:
 
-- a pinned, read-only runtime image;
-- a non-root user and no added capabilities;
-- no host home directory, original repository, credential store, or Docker socket;
-- one writable disposable workspace and bounded temporary storage;
-- CPU, memory, PID, runtime, and output limits;
-- no inbound host ports;
-- denied network egress except private broker/model endpoints;
-- a per-job identity and short-lived broker credential;
-- forced termination and capability revocation on cancel or timeout.
+- no host home directory, original repository, credential store, ambient host environment, or container-management socket;
+- a writable disposable workspace separated from trusted workspace metadata;
+- denied general network egress, with only authenticated private broker/model endpoints;
+- a per-job identity and short-lived credentials;
+- runtime and protocol-output limits;
+- forced process-tree termination and capability revocation on cancellation, timeout, or failure;
+- no unrestricted fallback when an isolation control is unavailable.
 
-MCP is the mediation protocol, not the isolation mechanism. The sandbox provides isolation; the broker provides narrowly scoped access through explicit capabilities.
+The hardened Docker runner additionally provides a pinned read-only image, a non-root user, dropped capabilities, and CPU, memory, PID, open-file, and storage limits. Native OS runners must document weaker or platform-specific controls and may not claim Docker-equivalent isolation. The current macOS runner lacks equivalent CPU, memory, PID, and disk quotas.
+
+MCP is the mediation protocol, not the isolation mechanism. The sandbox provides isolation; the broker provides narrowly scoped access through explicit capabilities. No runner provides “complete” isolation against compromise of its kernel, runtime, trusted host, or dependency supply chain.
 
 ## Request flow
 
@@ -150,8 +152,8 @@ MCP is the mediation protocol, not the isolation mechanism. The sandbox provides
 
 ## Current implementation
 
-Pi, its built-in read/write/bash tools, and its in-memory session now run only inside the Docker worker. The host package no longer installs Pi or exposes a host-side agent/MCP adapter. Workers receive only a disposable workspace, safe model-selection metadata, and normalized approval responses; they receive no host environment or credentials.
+Pi, its built-in read/write/bash tools, and its in-memory session now run only inside a Docker or native macOS worker. The host package no longer installs Pi or exposes a host-side agent/MCP adapter. Workers receive only a disposable workspace, safe model-selection metadata, and normalized approval responses; they receive no host environment or credentials.
 
-The host exposes authenticated, job-scoped broker and model-proxy Unix sockets mounted read-only into native Linux workers. The worker registers its scoped tools and proxy provider with Pi. The broker exposes only metadata, patch submission/status, and separately approved patch application; the model proxy fixes one trusted provider/model without disclosing its credential. Docker Desktop for macOS cannot forward host Unix sockets and fails both paths closed. Approvals reduce accidental tool use inside the disposable workspace; sandbox isolation—not approval—is the security seam.
+The host exposes authenticated, job-scoped broker and model-proxy Unix sockets to native Linux Docker workers and native macOS Seatbelt workers. The worker registers its scoped tools and proxy provider with Pi. The broker exposes only metadata, patch submission/status, and separately approved patch application; the model proxy fixes one trusted provider/model without disclosing its credential. Docker Desktop for macOS cannot forward host Unix sockets and fails both paths closed; the native runner does not cross that VM boundary. Approvals reduce accidental tool use inside the disposable workspace; sandbox isolation—not approval—is the security seam.
 
-The trusted host is one Rust binary with transport-neutral commands and structured replies. It contains the CLI and optional Signal ingress, disposable workspace manager, Docker lifecycle, scoped capability broker, and native model proxy. The legacy TypeScript host and its dependency tree have been removed. Node remains intentionally confined to the untrusted worker image because Pi is a JavaScript dependency; no Node runtime is needed on the trusted host. See [ADR 0001](adr/0001-rust-host-and-ingress-adapters.md) and [`rust-host.md`](rust-host.md).
+The trusted host is one Rust binary with transport-neutral commands and structured replies. It contains the CLI and optional Signal ingress, disposable workspace manager, sandbox lifecycle adapters, scoped capability broker, and native model proxy. The legacy TypeScript host and its dependency tree have been removed. Pi and Node remain confined to the untrusted worker process; the native macOS runner requires a host-installed Node executable but does not load it into the trusted Rust process. See [ADR 0001](adr/0001-rust-host-and-ingress-adapters.md), [ADR 0002](adr/0002-secure-wrapper-not-agent-framework.md), and [`rust-host.md`](rust-host.md).

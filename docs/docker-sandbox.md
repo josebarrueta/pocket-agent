@@ -23,7 +23,7 @@ Build and publish the worker image from [`worker-image.md`](worker-image.md), th
 
 The Docker executable path must be absolute. The configured image must be either a complete local image ID (`sha256:...`) or a registry reference pinned by manifest digest (`name@sha256:...`). The host reconciles labeled containers and volumes from a previous run before accepting messages. Run only one host against a Docker daemon because reconciliation intentionally removes every resource carrying the `pocket-agent.managed=true` label.
 
-Docker is the only production runner. The host forwards only safe model metadata, tool policy, and short-lived capability/model credentials; it does not forward provider credentials or its ambient environment. On native Linux, the broker and model-proxy Unix-socket directories are the only read-only host bind mounts. Both grant access only after job authentication and are documented in [`capability-broker.md`](capability-broker.md) and [`model-proxy.md`](model-proxy.md). The worker remains `network=none`.
+Docker is the hardened cross-platform production runner. Apple Silicon macOS also has a native Seatbelt adapter with different guarantees; see [`native-macos-sandbox.md`](native-macos-sandbox.md). The host forwards only safe model metadata, tool policy, and short-lived capability/model credentials; it does not forward provider credentials or its ambient environment. On native Linux, the broker and model-proxy Unix-socket directories are the only read-only host bind mounts. Both grant access only after job authentication and are documented in [`capability-broker.md`](capability-broker.md) and [`model-proxy.md`](model-proxy.md). The worker remains `network=none`.
 
 ## Effective controls
 

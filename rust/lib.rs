@@ -1,3 +1,4 @@
+pub mod arcade;
 pub mod capability;
 pub mod cli;
 pub mod command;
@@ -6,6 +7,7 @@ pub mod docker;
 pub mod domain;
 pub mod harness;
 pub mod model_proxy;
+pub mod native;
 pub mod ports;
 pub mod signal;
 pub mod workspace;
@@ -170,7 +172,7 @@ mod tests {
         let cli = CliIngress::new(harness.clone(), terminal.clone(), "local-user".into());
 
         cli.run(CliCommand::Run(RunArgs {
-            repo: "app".into(),
+            repo: Some("app".into()),
             prompt: Some("fix".into()),
             bug: None,
         }))
@@ -193,7 +195,7 @@ mod tests {
         let cli = CliIngress::new(harness.clone(), terminal.clone(), "local-user".into());
 
         cli.run(CliCommand::Run(RunArgs {
-            repo: "app".into(),
+            repo: Some("app".into()),
             prompt: Some("change".into()),
             bug: None,
         }))

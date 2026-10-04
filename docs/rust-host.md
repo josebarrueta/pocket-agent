@@ -8,8 +8,11 @@ The trusted host is one Rust binary. Pi remains in the isolated Node worker; the
 
 ```bash
 cargo build --release --locked
+# From a Git worktree, local commands default to a disposable snapshot of cwd.
+./target/release/pocket-agent --config config.json run --prompt 'Fix the parser'
+./target/release/pocket-agent --config config.json shell
+# Or select an explicitly configured alias.
 ./target/release/pocket-agent --config config.json run --repo app --prompt 'Fix the parser'
-./target/release/pocket-agent --config config.json shell --repo app
 ./target/release/pocket-agent --config config.json serve signal
 ```
 
@@ -27,7 +30,7 @@ cargo build --release --locked
 
 The provider key is read from `agent.apiKeyEnv` into the host process. The worker receives a random revocable lease, fixed model metadata, and a read-only socket-directory mount. It does not receive the provider key or provider URL.
 
-The Rust host exposes built-in worker tools and the four curated workspace capabilities. Capability scope comes only from the authenticated job lease; no capability accepts a host path or command. Applying a submitted canonical patch requires a conversation- and job-scoped operator approval.
+The Rust host exposes built-in worker tools, four curated workspace capabilities, and any explicitly configured local-only Arcade capabilities. Capability scope comes only from the authenticated job lease; no capability accepts a host path, generic command, or arbitrary network destination. Applying a submitted canonical patch and Arcade tools configured with `ask` require conversation- and job-scoped operator approval.
 
 `serve signal` requires the optional `signal` configuration, waits for the local `signal-cli` HTTP/SSE daemon, accepts only allowlisted private senders, ignores group and sync messages, and formats structured harness events back into bounded Signal messages. CLI commands do not require Signal configuration. Signal account keys remain in the separately hardened daemon and never enter workers.
 

@@ -5,6 +5,8 @@ import { createConnection } from "node:net";
 import { createInterface } from "node:readline";
 
 const send = (message) => process.stdout.write(`${JSON.stringify(message)}\n`);
+const workspace = process.env.POCKET_AGENT_WORKSPACE ?? "/workspace";
+const inWorkspace = (name) => `${workspace}/${name}`;
 send({ type: "hello", supportedVersions: [1] });
 
 let negotiated = false;
@@ -22,7 +24,7 @@ for await (const line of lines) {
     process.exit(0);
   }
   if (message.type === "approval_response" && active) {
-    await appendFile("/workspace/approval.txt", `${message.answer}\n`);
+    await appendFile(inWorkspace("approval.txt"), `${message.answer}\n`);
     send({ protocolVersion: 1, type: "completion", jobId: active.jobId, runId: active.runId, output: "approval handled" });
     active = undefined;
     continue;
@@ -87,7 +89,7 @@ for await (const line of lines) {
       request.once("error", reject);
       request.end(body);
     });
-    await appendFile("/workspace/broker.json", JSON.stringify(brokerResult));
+    await appendFile(inWorkspace("broker.json"), JSON.stringify(brokerResult));
   }
   if (message.prompt.startsWith("probe-isolation:")) {
     const hostPath = message.prompt.slice("probe-isolation:".length);
@@ -95,11 +97,14 @@ for await (const line of lines) {
     try { await readFile(hostPath); } catch { hostFileAccessible = false; }
     let dockerSocketAccessible = true;
     try { await readFile("/var/run/docker.sock"); } catch { dockerSocketAccessible = false; }
-    await appendFile("/workspace/isolation.json", JSON.stringify({
+    const isolation = {
       inheritedSecret: process.env.POCKET_AGENT_HOST_TEST_SECRET ?? null,
       hostFileAccessible,
       dockerSocketAccessible,
-    }));
+    };
+    await appendFile(inWorkspace("isolation.json"), JSON.stringify(isolation));
+    send({ protocolVersion: 1, type: "completion", jobId: message.jobId, runId: message.runId, output: JSON.stringify(isolation) });
+    continue;
   }
   if (message.prompt.startsWith("probe-boundary:")) {
     const probe = JSON.parse(Buffer.from(message.prompt.slice("probe-boundary:".length), "base64url").toString("utf8"));
@@ -120,16 +125,25 @@ for await (const line of lines) {
       internetReachable: await connect("1.1.1.1", 53),
       hostPortReachable: await connect("172.17.0.1", probe.hostPort),
     };
-    await writeFile("/workspace/boundary.json", JSON.stringify(boundary));
+    await writeFile(inWorkspace("boundary.json"), JSON.stringify(boundary));
     send({ protocolVersion: 1, type: "completion", jobId: message.jobId, runId: message.runId, output: JSON.stringify(boundary) });
     continue;
   }
   if (message.prompt === "disk-pressure") {
     let bounded = false;
-    try { await writeFile("/workspace/fill", Buffer.alloc(32 * 1024 * 1024, 1)); } catch (error) { bounded = error?.code === "ENOSPC"; }
-    await rm("/workspace/fill", { force: true });
-    await writeFile("/workspace/disk.json", JSON.stringify({ bounded }));
+    try { await writeFile(inWorkspace("fill"), Buffer.alloc(32 * 1024 * 1024, 1)); } catch (error) { bounded = error?.code === "ENOSPC"; }
+    await rm(inWorkspace("fill"), { force: true });
+    await writeFile(inWorkspace("disk.json"), JSON.stringify({ bounded }));
     send({ protocolVersion: 1, type: "completion", jobId: message.jobId, runId: message.runId, output: JSON.stringify({ bounded }) });
+    continue;
+  }
+  if (message.prompt === "native-shell") {
+    const status = await new Promise((resolve) => {
+      const child = spawn("/bin/sh", ["-c", `printf shell-ok > ${JSON.stringify(inWorkspace("shell.txt"))}`], { stdio: "ignore" });
+      child.once("error", () => resolve(-1));
+      child.once("exit", (code) => resolve(code));
+    });
+    send({ protocolVersion: 1, type: "completion", jobId: message.jobId, runId: message.runId, output: `shell:${status}` });
     continue;
   }
   if (message.prompt === "fork-pressure") {
@@ -139,7 +153,7 @@ for await (const line of lines) {
     }
     await new Promise((resolve) => setTimeout(resolve, 250));
   }
-  await appendFile("/workspace/worker.txt", `${message.prompt}\n`);
+  await appendFile(inWorkspace("worker.txt"), `${message.prompt}\n`);
   send({
     protocolVersion: 1,
     type: "completion",

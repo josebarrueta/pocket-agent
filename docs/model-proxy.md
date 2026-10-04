@@ -15,7 +15,7 @@ The worker registers an inline `pocket-agent-proxy` Pi provider. Its stream impl
 
 The Rust host uses its native Anthropic Messages or OpenAI-compatible Chat Completions adapter with the configured API key, optional trusted base URL, retries disabled, and a hard timeout. Events are converted to the worker protocol and streamed back as bounded NDJSON. Provider diagnostics are removed and provider error text is replaced with a generic error before crossing into the worker.
 
-Docker remains `network=none`; only the host process can contact the provider. Native Linux Docker supports the private socket mount. Docker Desktop for macOS cannot forward host Unix sockets through its VM, so model access fails closed on that platform until a VM-local relay is added.
+Docker remains `network=none`; the native macOS profile also denies general network access, so only the host process can contact the provider. Native Linux Docker supports the private socket mount, and the macOS runner explicitly permits its job-scoped Unix socket. Docker Desktop for macOS cannot forward host Unix sockets through its VM, so model access fails closed when that runner is selected.
 
 ## Limits and revocation
 

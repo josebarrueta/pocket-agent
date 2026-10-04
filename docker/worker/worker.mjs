@@ -10,8 +10,8 @@ const MAX_MESSAGE_BYTES = 1024 * 1024 + 4096;
 const MAX_CAPABILITY_RESPONSE_BYTES = 8 * 1024 * 1024;
 const MAX_ERROR_BYTES = 8 * 1024;
 const EX_USAGE = 64;
-const WORKSPACE = "/workspace";
-const AGENT_DIR = "/tmp/home/.pi/agent";
+const WORKSPACE = process.env.POCKET_AGENT_WORKSPACE ?? "/workspace";
+const AGENT_DIR = process.env.POCKET_AGENT_AGENT_DIR ?? "/tmp/home/.pi/agent";
 
 let negotiated = false;
 let protocolVersion;

@@ -12,7 +12,10 @@ use serde::{Deserialize, Serialize};
 pub struct Config {
     #[serde(default)]
     pub signal: Option<SignalConfig>,
+    #[serde(default)]
     pub repositories: BTreeMap<String, PathBuf>,
+    #[serde(default)]
+    pub connectors: ConnectorsConfig,
     #[serde(default = "default_state_dir")]
     pub state_dir: PathBuf,
     pub sandbox: SandboxConfig,
@@ -28,13 +31,48 @@ pub struct SignalConfig {
     pub allowed_senders: Vec<String>,
 }
 
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ConnectorsConfig {
+    #[serde(default)]
+    pub arcade: Option<ArcadeConnectorConfig>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ArcadeConnectorConfig {
+    pub gateway_slug: String,
+    #[serde(default = "default_arcade_timeout")]
+    pub request_timeout_ms: u64,
+    #[serde(default = "default_arcade_calls")]
+    pub max_calls_per_job: u32,
+    #[serde(default = "default_arcade_request")]
+    pub max_request_bytes: usize,
+    #[serde(default = "default_arcade_response")]
+    pub max_response_bytes: usize,
+    pub tools: Vec<ArcadeToolConfig>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ArcadeToolConfig {
+    pub name: String,
+    pub upstream_name: String,
+    pub description: String,
+    pub input_schema: serde_json::Value,
+    #[serde(default = "default_allow")]
+    pub policy: Decision,
+}
+
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SandboxConfig {
     pub runner: SandboxKind,
     #[serde(default = "default_docker_path")]
     pub docker_path: PathBuf,
-    pub image: String,
+    pub image: Option<String>,
+    pub node_path: Option<PathBuf>,
+    pub worker_path: Option<PathBuf>,
     #[serde(default = "default_cpus")]
     pub cpus: f64,
     #[serde(default = "default_memory")]
@@ -51,6 +89,7 @@ pub struct SandboxConfig {
 #[serde(rename_all = "lowercase")]
 pub enum SandboxKind {
     Docker,
+    Native,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -117,19 +156,42 @@ impl Config {
         let contents = fs::read_to_string(path)
             .with_context(|| format!("read configuration {}", path.display()))?;
         let mut config: Self = serde_json::from_str(&contents).context("parse configuration")?;
-        ensure!(
-            !config.repositories.is_empty(),
-            "at least one repository is required"
-        );
         config.state_dir = expand_home(&config.state_dir)?;
-        ensure!(
-            config.sandbox.docker_path.is_absolute(),
-            "sandbox.dockerPath must be absolute"
-        );
-        ensure!(
-            is_digest_pinned(&config.sandbox.image),
-            "sandbox.image must be pinned by a complete sha256 digest"
-        );
+        match config.sandbox.runner {
+            SandboxKind::Docker => {
+                ensure!(
+                    config.sandbox.docker_path.is_absolute(),
+                    "sandbox.dockerPath must be absolute"
+                );
+                ensure!(
+                    config
+                        .sandbox
+                        .image
+                        .as_deref()
+                        .is_some_and(is_digest_pinned),
+                    "sandbox.image must be pinned by a complete sha256 digest"
+                );
+            }
+            SandboxKind::Native => {
+                ensure!(cfg!(target_os = "macos"), "native sandbox requires macOS");
+                ensure!(
+                    config
+                        .sandbox
+                        .node_path
+                        .as_ref()
+                        .is_some_and(|path| path.is_absolute()),
+                    "sandbox.nodePath must be absolute"
+                );
+                ensure!(
+                    config
+                        .sandbox
+                        .worker_path
+                        .as_ref()
+                        .is_some_and(|path| path.is_absolute()),
+                    "sandbox.workerPath must be absolute"
+                );
+            }
+        }
         ensure!(
             config.sandbox.cpus.is_finite()
                 && config.sandbox.cpus > 0.0
@@ -164,6 +226,9 @@ impl Config {
             (1..=1_000).contains(&config.agent.model_max_requests_per_minute),
             "agent.modelMaxRequestsPerMinute is out of range"
         );
+        if let Some(arcade) = &config.connectors.arcade {
+            validate_arcade(arcade)?;
+        }
         if let Some(signal) = &config.signal {
             ensure!(
                 !signal.account.is_empty()
@@ -224,6 +289,71 @@ fn valid_environment_name(value: &str) -> bool {
         && bytes.all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
 }
 
+fn validate_arcade(arcade: &ArcadeConnectorConfig) -> Result<()> {
+    ensure!(
+        !arcade.gateway_slug.is_empty()
+            && arcade.gateway_slug.len() <= 128
+            && arcade.gateway_slug.bytes().all(|byte| {
+                byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-' || byte == b'_'
+            }),
+        "connectors.arcade.gatewaySlug is invalid"
+    );
+    ensure!(
+        (1_000..=120_000).contains(&arcade.request_timeout_ms),
+        "connectors.arcade.requestTimeoutMs is out of range"
+    );
+    ensure!(
+        (1..=1_000).contains(&arcade.max_calls_per_job),
+        "connectors.arcade.maxCallsPerJob is out of range"
+    );
+    ensure!(
+        (1_024..=1024 * 1024).contains(&arcade.max_request_bytes),
+        "connectors.arcade.maxRequestBytes is out of range"
+    );
+    ensure!(
+        (1_024..=8 * 1024 * 1024).contains(&arcade.max_response_bytes),
+        "connectors.arcade.maxResponseBytes is out of range"
+    );
+    ensure!(!arcade.tools.is_empty(), "connectors.arcade.tools is empty");
+    let mut local = std::collections::BTreeSet::new();
+    let mut upstream = std::collections::BTreeSet::new();
+    for tool in &arcade.tools {
+        ensure!(
+            tool.name.starts_with("arcade.")
+                && tool.name.len() <= 128
+                && tool.name.bytes().all(|byte| {
+                    byte.is_ascii_alphanumeric() || byte == b'.' || byte == b'_' || byte == b'-'
+                }),
+            "Arcade local tool name is invalid"
+        );
+        ensure!(
+            !tool.upstream_name.is_empty() && tool.upstream_name.len() <= 256,
+            "Arcade upstream tool name is invalid"
+        );
+        ensure!(
+            !tool.description.is_empty() && tool.description.len() <= 2_048,
+            "Arcade tool description is invalid"
+        );
+        ensure!(
+            tool.input_schema
+                .get("type")
+                .and_then(|value| value.as_str())
+                == Some("object")
+                && tool
+                    .input_schema
+                    .get("additionalProperties")
+                    .and_then(|value| value.as_bool())
+                    == Some(false),
+            "Arcade input schemas must be closed object schemas"
+        );
+        ensure!(
+            local.insert(tool.name.clone()) && upstream.insert(tool.upstream_name.clone()),
+            "Arcade tool names must be unique"
+        );
+    }
+    Ok(())
+}
+
 fn default_state_dir() -> PathBuf {
     PathBuf::from("~/.local/share/pocket-agent")
 }
@@ -260,6 +390,21 @@ fn default_request_tokens() -> u32 {
 fn default_job_tokens() -> u64 {
     200_000
 }
+fn default_arcade_timeout() -> u64 {
+    30_000
+}
+fn default_arcade_calls() -> u32 {
+    30
+}
+fn default_arcade_request() -> usize {
+    64 * 1024
+}
+fn default_arcade_response() -> usize {
+    256 * 1024
+}
+fn default_allow() -> Decision {
+    Decision::Allow
+}
 
 #[cfg(test)]
 mod tests {
@@ -295,6 +440,43 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(config.signal.unwrap().account, "+1555");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_macos_configuration_does_not_require_docker_or_an_image() {
+        let config = load(
+            r#"{"repositories":{"app":"/tmp/app"},"sandbox":{"runner":"native","nodePath":"/opt/homebrew/bin/node","workerPath":"/opt/pocket-agent/worker.mjs"},"agent":{"model":"anthropic/claude","apiKeyEnv":"ANTHROPIC_API_KEY"}}"#,
+        )
+        .unwrap();
+        assert_eq!(config.sandbox.runner, SandboxKind::Native);
+        assert!(config.sandbox.image.is_none());
+        assert!(
+            load(
+                r#"{"repositories":{"app":"/tmp/app"},"sandbox":{"runner":"native"},"agent":{"model":"anthropic/claude","apiKeyEnv":"ANTHROPIC_API_KEY"}}"#,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn validates_slug_only_curated_arcade_configuration() {
+        let arcade = r#""connectors":{"arcade":{"gatewaySlug":"dev-gateway","tools":[{"name":"arcade.github_get_issue","upstreamName":"GitHub.GetIssue","description":"Read one issue.","inputSchema":{"type":"object","properties":{"number":{"type":"integer","minimum":1}},"required":["number"],"additionalProperties":false},"policy":"allow"}]}},"#;
+        let configured =
+            valid("").replace("\"repositories\":", &format!("{arcade}\"repositories\":"));
+        let config = load(&configured).unwrap();
+        let arcade = config.connectors.arcade.unwrap();
+        assert_eq!(arcade.gateway_slug, "dev-gateway");
+        assert_eq!(arcade.tools[0].name, "arcade.github_get_issue");
+
+        assert!(load(&configured.replace("dev-gateway", "https://evil.test/mcp")).is_err());
+        assert!(
+            load(&configured.replace(
+                "\"additionalProperties\":false",
+                "\"additionalProperties\":true"
+            ))
+            .is_err()
+        );
     }
 
     #[test]

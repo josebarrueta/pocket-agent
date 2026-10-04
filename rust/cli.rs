@@ -27,6 +27,11 @@ pub enum CliCommand {
     Run(RunArgs),
     /// Start an interactive local conversation.
     Shell(ShellArgs),
+    /// Manage the optional Arcade MCP Gateway connection.
+    Arcade {
+        #[command(subcommand)]
+        action: ArcadeCommand,
+    },
     /// Run a remote ingress adapter.
     Serve {
         #[command(subcommand)]
@@ -36,8 +41,9 @@ pub enum CliCommand {
 
 #[derive(Debug, Args)]
 pub struct RunArgs {
+    /// Configured repository alias. Defaults to a disposable snapshot of the current Git worktree.
     #[arg(long)]
-    pub repo: String,
+    pub repo: Option<String>,
     #[arg(long, conflicts_with = "bug")]
     pub prompt: Option<String>,
     #[arg(long, conflicts_with = "prompt")]
@@ -46,8 +52,15 @@ pub struct RunArgs {
 
 #[derive(Debug, Args)]
 pub struct ShellArgs {
+    /// Configured repository alias. Defaults to a disposable snapshot of the current Git worktree.
     #[arg(long)]
-    pub repo: String,
+    pub repo: Option<String>,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ArcadeCommand {
+    /// Delete this local principal's persisted gateway authorization.
+    Logout,
 }
 
 #[derive(Debug, Subcommand)]
@@ -101,7 +114,9 @@ impl CliIngress {
                 let replies: Arc<dyn ReplyPort> = Arc::new(CliReplies { events });
                 self.send(
                     HarnessCommand::Start {
-                        repository: args.repo,
+                        repository: args
+                            .repo
+                            .ok_or_else(|| anyhow!("local repository was not resolved"))?,
                         prompt,
                         kind,
                     },
@@ -118,6 +133,9 @@ impl CliIngress {
                 ))
             }
             CliCommand::Shell(args) => self.shell(args).await,
+            CliCommand::Arcade { .. } => Err(anyhow!(
+                "Arcade management command was not handled at startup"
+            )),
             CliCommand::Serve {
                 ingress: ServeCommand::Signal,
             } => Err(anyhow!("Signal ingress has not been migrated to Rust yet")),
@@ -134,7 +152,9 @@ impl CliIngress {
         let replies: Arc<dyn ReplyPort> = Arc::new(CliReplies { events });
         self.send(
             HarnessCommand::Start {
-                repository: args.repo,
+                repository: args
+                    .repo
+                    .ok_or_else(|| anyhow!("local repository was not resolved"))?,
                 prompt: first,
                 kind: JobKind::Task,
             },

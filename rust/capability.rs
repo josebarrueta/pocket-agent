@@ -30,12 +30,50 @@ use crate::{
 
 const MAX_REQUEST_BYTES: usize = 8 * 1024 * 1024;
 const MCP_VERSION: &str = "2025-06-18";
-const TOOL_NAMES: [&str; 4] = [
-    "workspace.read_metadata",
-    "workspace.submit_patch",
-    "workspace.get_patch_status",
-    "workspace.apply_patch",
-];
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CapabilityPolicy {
+    Allow,
+    Ask,
+}
+
+#[derive(Clone, Debug)]
+pub struct CapabilityDescriptor {
+    pub name: String,
+    pub description: String,
+    pub input_schema: Value,
+    pub policy: CapabilityPolicy,
+}
+
+#[derive(Clone)]
+pub struct CapabilityContext {
+    pub job_id: String,
+    pub ingress_id: String,
+    pub principal_id: String,
+    pub conversation_id: String,
+    pub repository: String,
+    pub events: Arc<Mutex<Option<Arc<dyn JobEventPort>>>>,
+}
+
+#[async_trait]
+pub trait CapabilityProvider: Send + Sync {
+    fn descriptors(&self, context: &CapabilityContext) -> Vec<CapabilityDescriptor>;
+    async fn normalize(
+        &self,
+        context: &CapabilityContext,
+        capability: &str,
+        arguments: Value,
+    ) -> Result<Value>;
+    async fn invoke(
+        &self,
+        context: &CapabilityContext,
+        capability: &str,
+        arguments: &Value,
+    ) -> Result<Value>;
+}
+
+struct WorkspaceProvider {
+    workspaces: WorkspaceManager,
+}
 
 #[derive(Clone, Debug)]
 pub struct CapabilityLimits {
@@ -56,6 +94,8 @@ impl Default for CapabilityLimits {
 
 struct LeaseState {
     job_id: String,
+    ingress_id: String,
+    principal_id: String,
     conversation_id: String,
     repository: String,
     expires_at_ms: u128,
@@ -67,7 +107,7 @@ struct LeaseState {
 pub struct CapabilityBroker {
     socket: PathBuf,
     audit: PathBuf,
-    workspaces: WorkspaceManager,
+    providers: Vec<Arc<dyn CapabilityProvider>>,
     limits: CapabilityLimits,
     leases: Arc<Mutex<HashMap<String, LeaseState>>>,
     started: AtomicBool,
@@ -81,6 +121,16 @@ impl CapabilityBroker {
         workspaces: WorkspaceManager,
         limits: CapabilityLimits,
     ) -> Result<Arc<Self>> {
+        Self::with_providers(socket, audit, workspaces, limits, Vec::new())
+    }
+
+    pub fn with_providers(
+        socket: PathBuf,
+        audit: PathBuf,
+        workspaces: WorkspaceManager,
+        limits: CapabilityLimits,
+        mut additional_providers: Vec<Arc<dyn CapabilityProvider>>,
+    ) -> Result<Arc<Self>> {
         ensure!(
             socket.is_absolute() && audit.is_absolute(),
             "Capability paths must be absolute"
@@ -91,10 +141,13 @@ impl CapabilityBroker {
                 && limits.output_bytes > 0,
             "Capability limits must be positive"
         );
+        let mut providers: Vec<Arc<dyn CapabilityProvider>> =
+            vec![Arc::new(WorkspaceProvider { workspaces })];
+        providers.append(&mut additional_providers);
         Ok(Arc::new(Self {
             socket,
             audit,
-            workspaces,
+            providers,
             limits,
             leases: Arc::new(Mutex::new(HashMap::new())),
             started: AtomicBool::new(false),
@@ -200,8 +253,11 @@ impl CapabilityBroker {
                 Ok(json!({ "jsonrpc": "2.0", "id": id, "result": {} }))
             }
             "tools/list" => {
-                self.authenticate(&credential, job_id)?;
-                Ok(json!({ "jsonrpc": "2.0", "id": id, "result": { "tools": tools() } }))
+                let context = self.capability_context(&credential, job_id)?;
+                let descriptors = self.descriptors(&context)?;
+                Ok(
+                    json!({ "jsonrpc": "2.0", "id": id, "result": { "tools": descriptors.into_iter().map(descriptor_json).collect::<Vec<_>>() } }),
+                )
             }
             "tools/call" => {
                 let params = params.ok_or_else(|| anyhow!("Missing capability parameters"))?;
@@ -241,7 +297,7 @@ impl CapabilityBroker {
             "Request ID is invalid"
         );
         let key = credential_hash(credential);
-        let (repository, conversation, events) = {
+        let context = {
             let mut leases = self.leases.lock().expect("capability lease lock");
             let lease = authenticate_locked(&mut leases, &key, job_id)?;
             ensure!(
@@ -253,26 +309,23 @@ impl CapabilityBroker {
                 "Request ID was already used"
             );
             lease.calls += 1;
-            (
-                lease.repository.clone(),
-                lease.conversation_id.clone(),
-                lease.events.clone(),
-            )
+            context_from_lease(lease)
         };
-        if !TOOL_NAMES.contains(&name) {
-            self.audit(job_id, &repository, name, None, "forbidden")?;
+        let Some((provider, descriptor)) = self.provider_for(&context, name)? else {
+            self.audit(job_id, &context.repository, name, None, "forbidden")?;
             bail!("Capability is outside this job scope");
-        }
-        let normalized = match normalize(name, arguments) {
+        };
+        let normalized = match provider.normalize(&context, name, arguments).await {
             Ok(normalized) => normalized,
             Err(error) => {
-                self.audit(job_id, &repository, name, None, "invalid_arguments")?;
+                self.audit(job_id, &context.repository, name, None, "invalid_arguments")?;
                 return Err(error);
             }
         };
         let digest = canonical_digest(&normalized);
-        if name == "workspace.apply_patch" {
-            let events = events
+        if descriptor.policy == CapabilityPolicy::Ask {
+            let events = context
+                .events
                 .lock()
                 .expect("capability event lock")
                 .clone()
@@ -280,58 +333,76 @@ impl CapabilityBroker {
             let approval = ApprovalRequest {
                 title: format!("Allow capability {name}?"),
                 detail: format!(
-                    "Repository: {repository}\nArguments: sha256:{digest}\nConversation: {conversation}"
+                    "Repository: {}\nArguments: sha256:{digest}\nConversation: {}",
+                    context.repository, context.conversation_id
                 ),
                 choices: vec!["yes".into(), "no".into()],
             };
             let answer = events.request_approval(approval).await?;
             self.authenticate(credential, job_id)?;
             if answer != "yes" {
-                self.audit(job_id, &repository, name, Some(&digest), "denied")?;
+                self.audit(job_id, &context.repository, name, Some(&digest), "denied")?;
                 bail!("Capability was denied by operator");
             }
         }
-        let outcome = self.invoke(job_id, &repository, name, &normalized);
+        let outcome = provider.invoke(&context, name, &normalized).await;
         match outcome {
             Ok(value) => {
                 ensure!(
                     serde_json::to_vec(&value)?.len() <= self.limits.output_bytes,
                     "Capability output limit exceeded"
                 );
-                self.audit(job_id, &repository, name, Some(&digest), "allowed")?;
+                self.audit(job_id, &context.repository, name, Some(&digest), "allowed")?;
                 Ok(value)
             }
             Err(error) => {
-                self.audit(job_id, &repository, name, Some(&digest), "failed")?;
+                self.audit(job_id, &context.repository, name, Some(&digest), "failed")?;
                 Err(error)
             }
         }
     }
 
-    fn invoke(
-        &self,
-        job_id: &str,
-        repository: &str,
-        name: &str,
-        arguments: &Value,
-    ) -> Result<Value> {
-        match name {
-            "workspace.read_metadata" => self.workspaces.read_metadata(job_id, repository),
-            "workspace.submit_patch" => status_json(self.workspaces.submit_patch(
-                job_id,
-                repository,
-                arguments["patch"].as_str().unwrap_or_default(),
-            )?),
-            "workspace.get_patch_status" => {
-                status_json(self.workspaces.patch_status(job_id, repository)?)
+    fn descriptors(&self, context: &CapabilityContext) -> Result<Vec<CapabilityDescriptor>> {
+        let mut names = BTreeSet::new();
+        let mut descriptors = Vec::new();
+        for provider in &self.providers {
+            for descriptor in provider.descriptors(context) {
+                ensure!(
+                    names.insert(descriptor.name.clone()),
+                    "Duplicate capability name"
+                );
+                descriptors.push(descriptor);
             }
-            "workspace.apply_patch" => status_json(self.workspaces.apply_patch(
-                job_id,
-                repository,
-                arguments["patchId"].as_str().unwrap_or_default(),
-            )?),
-            _ => bail!("Capability is outside this job scope"),
         }
+        Ok(descriptors)
+    }
+
+    fn provider_for(
+        &self,
+        context: &CapabilityContext,
+        name: &str,
+    ) -> Result<Option<(Arc<dyn CapabilityProvider>, CapabilityDescriptor)>> {
+        let mut found = None;
+        for provider in &self.providers {
+            if let Some(descriptor) = provider
+                .descriptors(context)
+                .into_iter()
+                .find(|descriptor| descriptor.name == name)
+            {
+                ensure!(found.is_none(), "Duplicate capability name");
+                found = Some((provider.clone(), descriptor));
+            }
+        }
+        Ok(found)
+    }
+
+    fn capability_context(&self, credential: &str, job_id: &str) -> Result<CapabilityContext> {
+        let mut leases = self.leases.lock().expect("capability lease lock");
+        Ok(context_from_lease(authenticate_locked(
+            &mut leases,
+            &credential_hash(credential),
+            job_id,
+        )?))
     }
 
     fn authenticate(&self, credential: &str, job_id: &str) -> Result<()> {
@@ -383,6 +454,8 @@ impl WorkerAccessIssuer for CapabilityBroker {
             key.clone(),
             LeaseState {
                 job_id: spec.job_id.clone(),
+                ingress_id: spec.ingress_id.clone(),
+                principal_id: spec.principal_id.clone(),
                 conversation_id: spec.conversation_id.clone(),
                 repository: spec.repository.clone(),
                 expires_at_ms: now_ms()? + self.limits.lease_lifetime.as_millis(),
@@ -465,45 +538,134 @@ fn authenticate_locked<'a>(
     Ok(lease)
 }
 
-fn normalize(name: &str, arguments: Value) -> Result<Value> {
-    let object = arguments
-        .as_object()
-        .ok_or_else(|| anyhow!("arguments must be an object"))?;
-    match name {
-        "workspace.read_metadata" | "workspace.get_patch_status" => ensure!(
-            object.is_empty(),
-            "arguments contain missing or unknown fields"
-        ),
-        "workspace.submit_patch" => ensure!(
-            object.len() == 1 && object.get("patch").and_then(Value::as_str).is_some(),
-            "patch must be a string"
-        ),
-        "workspace.apply_patch" => {
-            let id = object
-                .get("patchId")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            ensure!(
-                object.len() == 1
-                    && id.len() == 64
-                    && id
-                        .bytes()
-                        .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()),
-                "patchId must be a SHA-256 identifier"
-            );
-        }
-        _ => bail!("Capability is outside this job scope"),
+#[async_trait]
+impl CapabilityProvider for WorkspaceProvider {
+    fn descriptors(&self, _context: &CapabilityContext) -> Vec<CapabilityDescriptor> {
+        vec![
+            descriptor(
+                "workspace.read_metadata",
+                "Read bounded metadata for the authenticated job workspace.",
+                json!({ "type": "object", "additionalProperties": false }),
+                CapabilityPolicy::Allow,
+            ),
+            descriptor(
+                "workspace.submit_patch",
+                "Validate and submit a candidate unified Git patch for the authenticated job.",
+                json!({ "type": "object", "properties": { "patch": { "type": "string" } }, "required": ["patch"], "additionalProperties": false }),
+                CapabilityPolicy::Allow,
+            ),
+            descriptor(
+                "workspace.get_patch_status",
+                "Read the current candidate patch status for the authenticated job.",
+                json!({ "type": "object", "additionalProperties": false }),
+                CapabilityPolicy::Allow,
+            ),
+            descriptor(
+                "workspace.apply_patch",
+                "Apply one previously submitted candidate patch to its configured repository.",
+                json!({ "type": "object", "properties": { "patchId": { "type": "string", "pattern": "^[a-f0-9]{64}$" } }, "required": ["patchId"], "additionalProperties": false }),
+                CapabilityPolicy::Ask,
+            ),
+        ]
     }
-    Ok(arguments)
+
+    async fn normalize(
+        &self,
+        _context: &CapabilityContext,
+        name: &str,
+        arguments: Value,
+    ) -> Result<Value> {
+        let object = arguments
+            .as_object()
+            .ok_or_else(|| anyhow!("arguments must be an object"))?;
+        match name {
+            "workspace.read_metadata" | "workspace.get_patch_status" => ensure!(
+                object.is_empty(),
+                "arguments contain missing or unknown fields"
+            ),
+            "workspace.submit_patch" => ensure!(
+                object.len() == 1 && object.get("patch").and_then(Value::as_str).is_some(),
+                "patch must be a string"
+            ),
+            "workspace.apply_patch" => {
+                let id = object
+                    .get("patchId")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                ensure!(
+                    object.len() == 1
+                        && id.len() == 64
+                        && id
+                            .bytes()
+                            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()),
+                    "patchId must be a SHA-256 identifier"
+                );
+            }
+            _ => bail!("Capability is outside this job scope"),
+        }
+        Ok(arguments)
+    }
+
+    async fn invoke(
+        &self,
+        context: &CapabilityContext,
+        name: &str,
+        arguments: &Value,
+    ) -> Result<Value> {
+        match name {
+            "workspace.read_metadata" => self
+                .workspaces
+                .read_metadata(&context.job_id, &context.repository),
+            "workspace.submit_patch" => status_json(self.workspaces.submit_patch(
+                &context.job_id,
+                &context.repository,
+                arguments["patch"].as_str().unwrap_or_default(),
+            )?),
+            "workspace.get_patch_status" => status_json(
+                self.workspaces
+                    .patch_status(&context.job_id, &context.repository)?,
+            ),
+            "workspace.apply_patch" => status_json(self.workspaces.apply_patch(
+                &context.job_id,
+                &context.repository,
+                arguments["patchId"].as_str().unwrap_or_default(),
+            )?),
+            _ => bail!("Capability is outside this job scope"),
+        }
+    }
 }
 
-fn tools() -> Value {
-    json!([
-        { "name": "workspace.read_metadata", "description": "Read bounded metadata for the authenticated job workspace.", "inputSchema": { "type": "object", "additionalProperties": false } },
-        { "name": "workspace.submit_patch", "description": "Validate and submit a candidate unified Git patch for the authenticated job.", "inputSchema": { "type": "object", "properties": { "patch": { "type": "string" } }, "required": ["patch"], "additionalProperties": false } },
-        { "name": "workspace.get_patch_status", "description": "Read the current candidate patch status for the authenticated job.", "inputSchema": { "type": "object", "additionalProperties": false } },
-        { "name": "workspace.apply_patch", "description": "Apply one previously submitted candidate patch to its configured repository.", "inputSchema": { "type": "object", "properties": { "patchId": { "type": "string", "pattern": "^[a-f0-9]{64}$" } }, "required": ["patchId"], "additionalProperties": false } }
-    ])
+fn descriptor(
+    name: &str,
+    description: &str,
+    input_schema: Value,
+    policy: CapabilityPolicy,
+) -> CapabilityDescriptor {
+    CapabilityDescriptor {
+        name: name.to_owned(),
+        description: description.to_owned(),
+        input_schema,
+        policy,
+    }
+}
+
+fn descriptor_json(descriptor: CapabilityDescriptor) -> Value {
+    json!({
+        "name": descriptor.name,
+        "description": descriptor.description,
+        "inputSchema": descriptor.input_schema,
+    })
+}
+
+fn context_from_lease(lease: &LeaseState) -> CapabilityContext {
+    CapabilityContext {
+        job_id: lease.job_id.clone(),
+        ingress_id: lease.ingress_id.clone(),
+        principal_id: lease.principal_id.clone(),
+        conversation_id: lease.conversation_id.clone(),
+        repository: lease.repository.clone(),
+        events: lease.events.clone(),
+    }
 }
 
 fn status_json(status: WorkspacePatchStatus) -> Result<Value> {

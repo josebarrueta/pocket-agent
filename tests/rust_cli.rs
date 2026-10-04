@@ -46,5 +46,21 @@ fn signal_configuration_is_required_only_for_signal_ingress() {
     assert!(!cli.status.success());
     assert!(cli_error.contains("Configured model credential"));
     assert!(!cli_error.contains("Signal configuration is required"));
+
+    let cwd_cli = Command::new(binary)
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .args([
+            "--config",
+            config.to_str().unwrap(),
+            "run",
+            "--prompt",
+            "test",
+        ])
+        .output()
+        .unwrap();
+    let cwd_error = String::from_utf8_lossy(&cwd_cli.stderr);
+    assert!(!cwd_cli.status.success());
+    assert!(cwd_error.contains("Configured model credential"));
+    assert!(!cwd_error.contains("--repo"));
     let _ = fs::remove_dir_all(root);
 }
