@@ -300,6 +300,14 @@ fn format_event(event: HarnessEvent) -> String {
             "❓ [{job_id}] {title}\n{detail}\nReply /answer {request_id} <{}>",
             choices.join("|")
         ),
+        HarnessEvent::AuthorizationRequired {
+            job_id,
+            connector,
+            capability,
+            url,
+        } => format!(
+            "🔐 [{job_id}] Authorization required for {connector}/{capability}. Open this URL, then explicitly retry:\n{url}"
+        ),
         HarnessEvent::TurnCompleted {
             job_id,
             output,

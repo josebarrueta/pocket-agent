@@ -3,7 +3,7 @@ use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
 use anyhow::Result;
 use async_trait::async_trait;
 
-use crate::domain::{ApprovalRequest, HarnessEvent, JobSpec, TurnResult};
+use crate::domain::{ApprovalRequest, AuthorizationRequest, HarnessEvent, JobSpec, TurnResult};
 
 #[async_trait]
 pub trait ReplyPort: Send + Sync {
@@ -14,6 +14,7 @@ pub trait ReplyPort: Send + Sync {
 pub trait JobEventPort: Send + Sync {
     async fn status(&self, message: &str) -> Result<()>;
     async fn request_approval(&self, request: ApprovalRequest) -> Result<String>;
+    async fn authorization_required(&self, request: AuthorizationRequest) -> Result<()>;
 }
 
 #[async_trait]

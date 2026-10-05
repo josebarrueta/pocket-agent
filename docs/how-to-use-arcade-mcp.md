@@ -42,11 +42,13 @@ Arcade's gateway tool picker is the first allowlist. Pocket Agent deliberately r
 For every tool you intend to expose, obtain its exact MCP `tools/list` descriptor from a trusted OAuth-capable MCP inspector/client or Arcade's official tool documentation. Record:
 
 - the exact upstream `name`;
-- the exact `inputSchema`;
+- the exact upstream `inputSchema`, stored as `upstreamInputSchema`;
+- a narrower closed `inputSchema` for arguments the worker may supply;
+- a closed `outputSchema` selecting and bounding fields returned to the model;
 - what data it reads or changes;
 - whether Pocket Agent should `allow`, `ask`, or `deny` it.
 
-The configured `inputSchema` must exactly equal Arcade's current descriptor. Pocket Agent disables calls when it detects schema drift. Do not copy tool names or schemas from model output, repository files, or an untrusted message.
+The configured `upstreamInputSchema` must exactly equal Arcade's current descriptor. Pocket Agent disables the tool when it detects schema drift. The local `inputSchema` may only narrow that authority and uses Pocket Agent's deliberately restricted JSON Schema subset. The `outputSchema` removes unreviewed fields before results enter model context. Do not copy tool names or schemas from model output, repository files, or an untrusted message.
 
 Start with one read-only tool. Add mutating tools only after the read-only path works.
 
@@ -68,6 +70,15 @@ Add `connectors.arcade` to `config.json`. Merge it with the existing repository,
           "name": "arcade.github_get_issue",
           "upstreamName": "COPY_THE_EXACT_ARCADE_TOOL_NAME",
           "description": "Read one GitHub issue from the authorized account.",
+          "upstreamInputSchema": {
+            "type": "object",
+            "properties": {
+              "owner": { "type": "string" },
+              "repo": { "type": "string" },
+              "number": { "type": "integer" }
+            },
+            "required": ["owner", "repo", "number"]
+          },
           "inputSchema": {
             "type": "object",
             "properties": {
@@ -78,6 +89,15 @@ Add `connectors.arcade` to `config.json`. Merge it with the existing repository,
             "required": ["owner", "repo", "number"],
             "additionalProperties": false
           },
+          "outputSchema": {
+            "type": "object",
+            "properties": {
+              "title": { "type": "string", "maxLength": 500 },
+              "body": { "type": "string", "maxLength": 20000 }
+            },
+            "required": ["title"],
+            "additionalProperties": false
+          },
           "policy": "allow"
         }
       ]
@@ -86,7 +106,7 @@ Add `connectors.arcade` to `config.json`. Merge it with the existing repository,
 }
 ```
 
-The example name and schema are illustrative. Replace `upstreamName` and the complete `inputSchema` with Arcade's exact descriptor.
+The example name and schemas are illustrative. Replace `upstreamName` and `upstreamInputSchema` with Arcade's exact descriptor, then author narrower local input and output schemas. Configurations from the initial experimental connector that supplied only `inputSchema` must be migrated; Pocket Agent intentionally does not infer an output projection or silently treat an open upstream schema as local authority.
 
 Configuration fields:
 
@@ -100,10 +120,12 @@ Configuration fields:
 | `tools[].name` | Stable worker-facing name; it must begin with `arcade.`. |
 | `tools[].upstreamName` | Exact Arcade MCP tool name. |
 | `tools[].description` | Locally reviewed description shown to the agent. |
-| `tools[].inputSchema` | Closed JSON object schema pinned to Arcade's descriptor. |
+| `tools[].upstreamInputSchema` | Exact schema from Arcade, used only for drift detection. It may be open. |
+| `tools[].inputSchema` | Closed local argument schema enforced by Pocket Agent. |
+| `tools[].outputSchema` | Closed projection schema selecting and bounding returned fields. |
 | `tools[].policy` | `allow`, `ask`, or `deny`. Use `ask` for mutations. |
 
-Pocket Agent rejects arbitrary gateway URLs, open-ended object schemas, duplicate names, unknown configuration fields, and unsafe limits.
+Pocket Agent rejects arbitrary gateway URLs, open-ended local object schemas, duplicate names, unknown configuration fields, unsafe limits, and unsupported local JSON Schema keywords. Local schemas support `object`, `array`, `string`, `integer`, `number`, `boolean`, and `null`, plus closed properties/required fields, size ranges, numeric ranges, `enum`, and `const`. Unsupported keywords fail configuration rather than being silently ignored.
 
 ## 4. Start Pocket Agent in the project
 
@@ -124,7 +146,7 @@ Current-directory mode still creates a disposable snapshot. The worker never rec
 
 ## 5. Complete gateway authorization
 
-Ask the agent to use the configured read-only Arcade tool. On its first call, Pocket Agent prints an authorization URL:
+Start a local job with the connector configured. While the worker verifies its curated tool list—and before any tool can be shown to the agent—Pocket Agent prints an authorization URL on first use:
 
 ```text
 Arcade authorization required. Open this URL in your browser:
@@ -191,7 +213,7 @@ Delete the local gateway grant:
 pocket-agent --config /path/to/config.json arcade logout
 ```
 
-The next tool call starts browser authorization again. This removes Pocket Agent's gateway grant from Keychain; use Arcade or the downstream provider's account settings when you also need to revoke provider-level grants.
+The next local job/tool-list verification starts browser authorization again. This removes Pocket Agent's gateway grant from Keychain; use Arcade or the downstream provider's account settings when you also need to revoke provider-level grants.
 
 ## Troubleshooting
 
@@ -232,4 +254,4 @@ Pocket Agent does not automatically replay ambiguous calls. Check Arcade/provide
 - only Streamable HTTP tools are supported;
 - prompts, resources, roots, sampling, generic elicitation, and arbitrary MCP servers are not exposed;
 - tool descriptors must be copied and reviewed manually;
-- the live Arcade wire flow still needs verification against an operator-provided development gateway.
+- the live Arcade wire flow still needs verification against an operator-provided development gateway. On macOS, run the ignored `live_gateway_verifies_the_reviewed_wire_protocol` test with `POCKET_AGENT_ARCADE_LIVE_CONFIG` set to the connector JSON object; it opens the browser interactively and stores the test grant in Keychain.

@@ -195,6 +195,15 @@ On macOS, local CLI jobs can use a curated Arcade MCP Gateway without an Arcade 
           "name": "arcade.github_get_issue",
           "upstreamName": "GitHub.GetIssue",
           "description": "Read one GitHub issue from the authorized account.",
+          "upstreamInputSchema": {
+            "type": "object",
+            "properties": {
+              "owner": { "type": "string" },
+              "repo": { "type": "string" },
+              "number": { "type": "integer" }
+            },
+            "required": ["owner", "repo", "number"]
+          },
           "inputSchema": {
             "type": "object",
             "properties": {
@@ -205,6 +214,15 @@ On macOS, local CLI jobs can use a curated Arcade MCP Gateway without an Arcade 
             "required": ["owner", "repo", "number"],
             "additionalProperties": false
           },
+          "outputSchema": {
+            "type": "object",
+            "properties": {
+              "title": { "type": "string", "maxLength": 500 },
+              "body": { "type": "string", "maxLength": 20000 }
+            },
+            "required": ["title"],
+            "additionalProperties": false
+          },
           "policy": "allow"
         }
       ]
@@ -213,9 +231,9 @@ On macOS, local CLI jobs can use a curated Arcade MCP Gateway without an Arcade 
 }
 ```
 
-The pinned `upstreamName` and `inputSchema` must exactly match the tool currently exposed by the Arcade gateway. Pocket Agent refuses schema drift instead of silently broadening authority. Use `"policy": "ask"` for mutating tools and `"deny"` to keep a configured tool hidden.
+The pinned `upstreamName` and `upstreamInputSchema` must exactly match the descriptor currently exposed by Arcade. The separate closed `inputSchema` defines the narrower arguments the worker may send, while `outputSchema` selects and bounds fields returned to the model. Pocket Agent refuses upstream drift instead of silently broadening authority. Use `"policy": "ask"` for mutating tools and `"deny"` to keep a configured tool hidden.
 
-The first tool call prints an Arcade browser-authorization URL. Complete it on the same Mac; Pocket Agent receives the PKCE callback on loopback and stores the gateway registration and tokens in macOS Keychain. Arcade retains downstream GitHub, Linear, Datadog, and other tool grants. Later jobs and process restarts reuse and refresh those grants. Tool-level authorization may print another Arcade URL; complete it and explicitly retry the operation. Mutating calls are never replayed automatically.
+The first local job verifies its configured Arcade tools before exposing them and prints an Arcade browser-authorization URL. Complete it on the same Mac; Pocket Agent receives the PKCE callback on loopback and stores the gateway registration and tokens in macOS Keychain. Arcade retains downstream GitHub, Linear, Datadog, and other tool grants. Later jobs and process restarts reuse and refresh those grants. Tool-level authorization may print another Arcade URL; complete it and explicitly retry the operation. Mutating calls are never replayed automatically.
 
 The connector is intentionally available only to local CLI principals in this first slice. Workers still have no general network access and receive no gateway or downstream tokens. To switch accounts or recover from a revoked/corrupt grant, delete the local gateway grant and authorize again on the next tool call:
 

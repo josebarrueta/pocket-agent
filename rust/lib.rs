@@ -26,8 +26,8 @@ mod tests {
     use crate::{
         cli::{CliCommand, CliIngress, RunArgs, Terminal},
         domain::{
-            ApprovalRequest, HarnessCommand, HarnessEvent, HarnessRequest, JobKind, JobSpec,
-            RequestContext, TurnResult,
+            ApprovalRequest, AuthorizationRequest, HarnessCommand, HarnessEvent, HarnessRequest,
+            JobKind, JobSpec, RequestContext, TurnResult,
         },
         harness::Harness,
         ports::{JobEventPort, JobFactory, JobHandle, ReplyPort},
@@ -83,6 +83,15 @@ mod tests {
             events: Arc<dyn JobEventPort>,
         ) -> Result<TurnResult> {
             events.status("working").await?;
+            if prompt == "authorize" {
+                events
+                    .authorization_required(AuthorizationRequest {
+                        connector: "arcade".into(),
+                        capability: "arcade.issue".into(),
+                        url: "https://auth.arcade.dev/authorize/one".into(),
+                    })
+                    .await?;
+            }
             let suffix = if self.approval {
                 events
                     .request_approval(ApprovalRequest {
@@ -261,6 +270,38 @@ mod tests {
         assert!(matches!(
             replies.events.lock().await.last().unwrap().1,
             HarnessEvent::Error { .. }
+        ));
+        harness.close().await;
+    }
+
+    #[tokio::test]
+    async fn authorization_requirements_are_structured_harness_events() {
+        let harness = Harness::new(Arc::new(FakeFactory { approval: false }));
+        let replies = Arc::new(Replies::default());
+        harness
+            .handle(
+                request(
+                    "user",
+                    "terminal",
+                    HarnessCommand::Start {
+                        repository: "app".into(),
+                        prompt: "authorize".into(),
+                        kind: JobKind::Task,
+                    },
+                ),
+                replies.clone(),
+            )
+            .await
+            .unwrap();
+        let event = replies
+            .wait_for(|event| matches!(event, HarnessEvent::AuthorizationRequired { .. }))
+            .await;
+        assert!(matches!(
+            event,
+            HarnessEvent::AuthorizationRequired { connector, capability, url, .. }
+                if connector == "arcade"
+                    && capability == "arcade.issue"
+                    && url == "https://auth.arcade.dev/authorize/one"
         ));
         harness.close().await;
     }

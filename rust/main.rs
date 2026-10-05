@@ -64,11 +64,17 @@ async fn run() -> Result<()> {
         CliCommand::Serve {
             ingress: ServeCommand::Signal
         }
-    ) && config.signal.is_none()
-    {
-        return Err(anyhow!(
-            "Signal configuration is required for 'serve signal'"
-        ));
+    ) {
+        if config.signal.is_none() {
+            return Err(anyhow!(
+                "Signal configuration is required for 'serve signal'"
+            ));
+        }
+        if config.sandbox.runner == SandboxKind::Native {
+            return Err(anyhow!(
+                "the native macOS sandbox is local-interactive-only; use the Docker runner for remote ingress"
+            ));
+        }
     }
     if matches!(
         &cli.command,

@@ -54,6 +54,15 @@ Configuration is host-local and deny-by-default. Names are illustrative until th
           "name": "arcade.github_get_issue",
           "upstreamName": "GitHub.GetIssue",
           "description": "Read one GitHub issue from the operator's authorized account.",
+          "upstreamInputSchema": {
+            "type": "object",
+            "properties": {
+              "owner": { "type": "string" },
+              "repo": { "type": "string" },
+              "number": { "type": "integer" }
+            },
+            "required": ["owner", "repo", "number"]
+          },
           "inputSchema": {
             "type": "object",
             "properties": {
@@ -62,6 +71,15 @@ Configuration is host-local and deny-by-default. Names are illustrative until th
               "number": { "type": "integer", "minimum": 1 }
             },
             "required": ["owner", "repo", "number"],
+            "additionalProperties": false
+          },
+          "outputSchema": {
+            "type": "object",
+            "properties": {
+              "title": { "type": "string", "maxLength": 500 },
+              "body": { "type": "string", "maxLength": 20000 }
+            },
+            "required": ["title"],
             "additionalProperties": false
           },
           "policy": "allow"
@@ -100,7 +118,7 @@ trait CapabilityProvider: Send + Sync {
 
 The exact API may change, but responsibilities may not:
 
-- the broker owns lease authentication, job/conversation scope, replay prevention, policy, approval, global limits, and audit;
+- the broker authenticates each lease and owns job/conversation scope, replay prevention, policy, approval, global limits, and audit;
 - the provider owns tool-specific validation, normalization, fixed destination selection, upstream translation, session handling, and bounded result projection;
 - `CapabilityContext` supplies trusted principal, job, conversation, and repository identity;
 - callers cannot provide or override endpoint, upstream tool name, OAuth identity, host path, credential, or policy;
@@ -148,7 +166,7 @@ The Arcade URL is safe to show to the authenticated operator, but it is not adde
 4. **Credential confinement.** OAuth client registrations and access/refresh tokens are stored only in an OS credential store and used only by the Rust host. They are absent from config, worker environment/arguments, model context, events, approvals, results, errors, and audit.
 5. **Trusted identity binding.** A stored grant is keyed by canonical gateway URL, auth mode/issuer, and trusted ingress-qualified principal. Workers and prompts cannot choose, export, or impersonate users.
 6. **Dual tool allowlists.** A tool must be selected in the Arcade Gateway and configured locally. Upstream discovery cannot automatically register a worker capability.
-7. **Reviewed descriptors.** Worker-facing names, descriptions, schemas, and policies are host-authored. Upstream schema mismatch disables the tool instead of broadening it.
+7. **Reviewed descriptors.** Worker-facing names, descriptions, local argument schemas, output projection schemas, and policies are host-authored. A separate exact upstream schema pin detects drift without requiring an upstream schema to be closed. Upstream mismatch disables the tool instead of broadening it.
 8. **Protocol reduction.** The connector supports only initialization, tool verification, and tool calls. Prompts, resources, roots, sampling, elicitation, arbitrary notifications, and server-initiated model calls are unavailable.
 9. **Bounded projection.** Expected structured fields are extracted under byte/depth/item limits. Raw upstream descriptions, instructions, HTML, logs, and payloads are not blindly inserted into model context.
 10. **Scoped authorization.** Pocket Agent policy still binds calls to lease, principal, job, conversation, request ID, expiry, call count, normalized digest, and one-operation approval when configured as `ask`.

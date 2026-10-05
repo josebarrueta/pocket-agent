@@ -25,6 +25,7 @@ use crate::{
 };
 
 const MCP_VERSION: &str = "2025-06-18";
+const TRUSTED_ARCADE_HOSTS: [&str; 3] = ["api.arcade.dev", "auth.arcade.dev", "cloud.arcade.dev"];
 #[cfg(target_os = "macos")]
 const KEYCHAIN_SERVICE: &str = "dev.pocket-agent.arcade-oauth";
 
@@ -104,8 +105,6 @@ struct StoredGrant {
 struct ResourceMetadata {
     resource: String,
     authorization_servers: Vec<String>,
-    #[serde(default)]
-    scopes_supported: Vec<String>,
 }
 
 struct OAuthChallenge {
@@ -136,6 +135,7 @@ struct TokenResponse {
     expires_in: Option<u64>,
 }
 
+#[derive(Debug)]
 struct McpResponse {
     value: Option<Value>,
     session_id: Option<String>,
@@ -152,6 +152,7 @@ pub struct ArcadeGatewayProvider {
     max_calls_per_job: u32,
     calls: Mutex<HashMap<String, u32>>,
     authorization_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    validated_grants: Mutex<std::collections::BTreeSet<String>>,
 }
 
 impl ArcadeGatewayProvider {
@@ -160,6 +161,14 @@ impl ArcadeGatewayProvider {
             "https://api.arcade.dev/mcp/{}",
             config.gateway_slug
         ))?;
+        Self::with_endpoint(config, store, endpoint)
+    }
+
+    fn with_endpoint(
+        config: ArcadeConnectorConfig,
+        store: Arc<dyn SecretStore>,
+        endpoint: Url,
+    ) -> Result<Arc<Self>> {
         let client = Client::builder()
             .user_agent(concat!("pocket-agent/", env!("CARGO_PKG_VERSION")))
             .redirect(reqwest::redirect::Policy::none())
@@ -180,6 +189,7 @@ impl ArcadeGatewayProvider {
             max_calls_per_job: config.max_calls_per_job,
             calls: Mutex::new(HashMap::new()),
             authorization_locks: Mutex::new(HashMap::new()),
+            validated_grants: Mutex::new(std::collections::BTreeSet::new()),
         }))
     }
 
@@ -221,7 +231,7 @@ impl ArcadeGatewayProvider {
         self.store.set(key, &serde_json::to_vec(grant)?)
     }
 
-    async fn access_token(&self, context: &CapabilityContext) -> Result<String> {
+    async fn access_token(&self, context: &CapabilityContext, capability: &str) -> Result<String> {
         let key = self.store_key(context);
         let lock = self.authorization_lock(&key);
         let _guard = lock.lock().await;
@@ -232,6 +242,21 @@ impl ArcadeGatewayProvider {
             );
             ensure_trusted_oauth_url(&grant.issuer)?;
             ensure_trusted_oauth_url(&grant.token_endpoint)?;
+            let validated = self
+                .validated_grants
+                .lock()
+                .expect("Arcade validated grant lock")
+                .contains(&key);
+            if !validated {
+                if let Err(error) = self.validate_stored_grant(&grant).await {
+                    self.store.delete(&key)?;
+                    return Err(error.context("Stored Arcade grant metadata changed"));
+                }
+                self.validated_grants
+                    .lock()
+                    .expect("Arcade validated grant lock")
+                    .insert(key.clone());
+            }
             if grant.expires_at_unix > now_unix()? + 60 {
                 return Ok(grant.access_token);
             }
@@ -245,16 +270,51 @@ impl ArcadeGatewayProvider {
                         return Ok(grant.access_token);
                     }
                     Err(error) if error.to_string().contains("token grant was rejected") => {
-                        self.store.delete(&key)?
+                        self.store.delete(&key)?;
+                        self.validated_grants
+                            .lock()
+                            .expect("Arcade validated grant lock")
+                            .remove(&key);
                     }
                     Err(error) => return Err(error),
                 }
             }
         }
-        let grant = self.authorize(context).await?;
+        let grant = self.authorize(context, capability).await?;
         let access_token = grant.access_token.clone();
         self.save_grant(&key, &grant)?;
+        self.validated_grants
+            .lock()
+            .expect("Arcade validated grant lock")
+            .insert(key);
         Ok(access_token)
+    }
+
+    async fn validate_stored_grant(&self, grant: &StoredGrant) -> Result<()> {
+        let oauth_challenge = self.discover_resource_metadata().await?;
+        let resource: ResourceMetadata = self
+            .get_metadata(&oauth_challenge.resource_metadata)
+            .await?;
+        ensure!(
+            canonical_url(&resource.resource)? == canonical_url(&grant.resource)?,
+            "Arcade resource metadata changed"
+        );
+        ensure!(
+            resource.authorization_servers.len() == 1
+                && canonical_url(&resource.authorization_servers[0])?
+                    == canonical_url(&grant.issuer)?,
+            "Arcade authorization issuer changed"
+        );
+        let authorization = self
+            .authorization_metadata(&canonical_url(&grant.issuer)?)
+            .await?;
+        ensure!(
+            canonical_url(&authorization.issuer)? == canonical_url(&grant.issuer)?
+                && canonical_url(&authorization.token_endpoint)?
+                    == canonical_url(&grant.token_endpoint)?,
+            "Arcade authorization metadata changed"
+        );
+        Ok(())
     }
 
     async fn refresh(&self, grant: &StoredGrant) -> Result<TokenResponse> {
@@ -273,7 +333,11 @@ impl ArcadeGatewayProvider {
         self.token_request(&grant.token_endpoint, &form).await
     }
 
-    async fn authorize(&self, context: &CapabilityContext) -> Result<StoredGrant> {
+    async fn authorize(
+        &self,
+        context: &CapabilityContext,
+        capability: &str,
+    ) -> Result<StoredGrant> {
         let oauth_challenge = self.discover_resource_metadata().await?;
         let resource: ResourceMetadata = self
             .get_metadata(&oauth_challenge.resource_metadata)
@@ -340,24 +404,13 @@ impl ArcadeGatewayProvider {
                 .append_pair("code_challenge_method", "S256")
                 .append_pair("state", &state)
                 .append_pair("resource", self.endpoint.as_str());
-            let scope = oauth_challenge.scope.or_else(|| {
-                (!resource.scopes_supported.is_empty()).then(|| resource.scopes_supported.join(" "))
-            });
-            if let Some(scope) = scope {
+            if let Some(scope) = oauth_challenge.scope {
                 query.append_pair("scope", &scope);
             }
         }
 
-        let events = context
-            .events
-            .lock()
-            .expect("capability event lock")
-            .clone()
-            .ok_or_else(|| anyhow!("No active local turn can authorize Arcade"))?;
-        events
-            .status(&format!(
-                "Arcade authorization required. Open this URL in your browser:\n{authorization_url}"
-            ))
+        context
+            .authorization_required("arcade", capability, authorization_url.as_str())
             .await?;
         let code = timeout(
             self.timeout.max(Duration::from_secs(300)),
@@ -490,6 +543,58 @@ impl ArcadeGatewayProvider {
         bounded_json(response, self.max_response_bytes).await
     }
 
+    async fn verified_tool_names(&self, token: &str) -> Result<Vec<String>> {
+        let initialize = self
+            .mcp(
+                token,
+                None,
+                json!({
+                    "jsonrpc": "2.0", "id": Uuid::new_v4().to_string(), "method": "initialize",
+                    "params": { "protocolVersion": MCP_VERSION, "capabilities": {}, "clientInfo": { "name": "pocket-agent", "version": env!("CARGO_PKG_VERSION") } }
+                }),
+                true,
+            )
+            .await?;
+        let session = initialize.session_id;
+        let result = async {
+            let initialized = initialize
+                .value
+                .ok_or_else(|| anyhow!("Arcade initialize response is empty"))?;
+            ensure!(
+                initialized
+                    .pointer("/result/protocolVersion")
+                    .and_then(Value::as_str)
+                    == Some(MCP_VERSION),
+                "Arcade negotiated an unsupported MCP protocol version"
+            );
+            self.mcp(
+                token,
+                session.as_deref(),
+                json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }),
+                false,
+            )
+            .await?;
+            let upstream = self.list_tools(token, session.as_deref()).await?;
+            Ok(self
+                .tools
+                .values()
+                .filter(|tool| {
+                    upstream.iter().any(|candidate| {
+                        candidate.get("name").and_then(Value::as_str)
+                            == Some(tool.upstream_name.as_str())
+                            && candidate.get("inputSchema") == Some(&tool.upstream_input_schema)
+                    })
+                })
+                .map(|tool| tool.name.clone())
+                .collect())
+        }
+        .await;
+        if let Some(session) = session.as_deref() {
+            self.close_session(token, session).await;
+        }
+        result
+    }
+
     async fn execute(
         &self,
         token: &str,
@@ -508,45 +613,54 @@ impl ArcadeGatewayProvider {
             )
             .await?;
         let session = initialize.session_id;
+        let initialized = initialize
+            .value
+            .ok_or_else(|| anyhow!("Arcade initialize response is empty"))?;
         ensure!(
-            initialize.value.is_some(),
-            "Arcade initialize response is empty"
+            initialized
+                .pointer("/result/protocolVersion")
+                .and_then(Value::as_str)
+                == Some(MCP_VERSION),
+            "Arcade negotiated an unsupported MCP protocol version"
         );
+        let result = self
+            .execute_in_session(token, session.as_deref(), tool, arguments)
+            .await;
+        if let Some(session) = session.as_deref() {
+            self.close_session(token, session).await;
+        }
+        result
+    }
+
+    async fn execute_in_session(
+        &self,
+        token: &str,
+        session: Option<&str>,
+        tool: &ArcadeToolConfig,
+        arguments: &Value,
+    ) -> Result<Value> {
         self.mcp(
             token,
-            session.as_deref(),
+            session,
             json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }),
             false,
         )
         .await?;
-        let listed = self
-            .mcp(
-                token,
-                session.as_deref(),
-                json!({ "jsonrpc": "2.0", "id": Uuid::new_v4().to_string(), "method": "tools/list", "params": {} }),
-                true,
-            )
+        let upstream = self
+            .list_tools(token, session)
             .await?
-            .value
-            .ok_or_else(|| anyhow!("Arcade tools/list response is empty"))?;
-        let upstream = listed
-            .pointer("/result/tools")
-            .and_then(Value::as_array)
-            .and_then(|tools| {
-                tools
-                    .iter()
-                    .find(|candidate| candidate["name"] == tool.upstream_name)
-            })
+            .into_iter()
+            .find(|candidate| candidate["name"] == tool.upstream_name)
             .ok_or_else(|| anyhow!("Configured Arcade tool is unavailable"))?;
         ensure!(
-            upstream.get("inputSchema") == Some(&tool.input_schema),
+            upstream.get("inputSchema") == Some(&tool.upstream_input_schema),
             "Configured Arcade tool schema changed"
         );
 
         let called = self
             .mcp(
                 token,
-                session.as_deref(),
+                session,
                 json!({
                     "jsonrpc": "2.0", "id": Uuid::new_v4().to_string(), "method": "tools/call",
                     "params": { "name": tool.upstream_name, "arguments": arguments }
@@ -556,12 +670,7 @@ impl ArcadeGatewayProvider {
             .await?
             .value
             .ok_or_else(|| anyhow!("Arcade tool response is empty"))?;
-        let elicitation = called
-            .get("method")
-            .and_then(Value::as_str)
-            .is_some_and(|method| method == "elicitation/create");
-        if elicitation
-            || called.get("error").is_some()
+        if called.get("error").is_some()
             || called.pointer("/result/isError") == Some(&Value::Bool(true))
         {
             if let Some(url) = find_arcade_authorization_url(&called) {
@@ -569,11 +678,64 @@ impl ArcadeGatewayProvider {
             }
             bail!("Arcade tool call failed");
         }
-        Ok(called
+        let result = called
             .pointer("/result/structuredContent")
-            .cloned()
-            .or_else(|| called.pointer("/result/content").cloned())
-            .unwrap_or(Value::Null))
+            .or_else(|| called.pointer("/result/content"))
+            .ok_or_else(|| anyhow!("Arcade tool response has no result content"))?;
+        project_result(result, &tool.output_schema, "result")
+    }
+
+    async fn list_tools(&self, token: &str, session: Option<&str>) -> Result<Vec<Value>> {
+        let mut tools = Vec::new();
+        let mut cursor: Option<String> = None;
+        let mut seen = std::collections::BTreeSet::new();
+        for _ in 0..32 {
+            let params = cursor
+                .as_ref()
+                .map_or_else(|| json!({}), |cursor| json!({ "cursor": cursor }));
+            let listed = self
+                .mcp(
+                    token,
+                    session,
+                    json!({ "jsonrpc": "2.0", "id": Uuid::new_v4().to_string(), "method": "tools/list", "params": params }),
+                    true,
+                )
+                .await?
+                .value
+                .ok_or_else(|| anyhow!("Arcade tools/list response is empty"))?;
+            let page = listed
+                .pointer("/result/tools")
+                .and_then(Value::as_array)
+                .ok_or_else(|| anyhow!("Arcade tools/list response is malformed"))?;
+            ensure!(
+                tools.len().saturating_add(page.len()) <= 10_000,
+                "Arcade tools/list returned too many tools"
+            );
+            tools.extend(page.iter().cloned());
+            match listed.pointer("/result/nextCursor") {
+                None | Some(Value::Null) => return Ok(tools),
+                Some(Value::String(next)) if !next.is_empty() && next.len() <= 1024 => {
+                    ensure!(
+                        seen.insert(next.clone()),
+                        "Arcade tools/list cursor repeated"
+                    );
+                    cursor = Some(next.clone());
+                }
+                _ => bail!("Arcade tools/list cursor is malformed"),
+            }
+        }
+        bail!("Arcade tools/list exceeded its page limit")
+    }
+
+    async fn close_session(&self, token: &str, session: &str) {
+        let _ = self
+            .client
+            .delete(self.endpoint.clone())
+            .bearer_auth(token)
+            .header("MCP-Protocol-Version", MCP_VERSION)
+            .header("Mcp-Session-Id", session)
+            .send()
+            .await;
     }
 
     async fn mcp(
@@ -583,6 +745,11 @@ impl ArcadeGatewayProvider {
         body: Value,
         expect_body: bool,
     ) -> Result<McpResponse> {
+        let expected_id = body.get("id").cloned();
+        ensure!(
+            !expect_body || expected_id.is_some(),
+            "MCP request expecting a response has no ID"
+        );
         let mut request = self
             .client
             .post(self.endpoint.clone())
@@ -615,12 +782,21 @@ impl ArcadeGatewayProvider {
             .and_then(|value| value.to_str().ok())
             .unwrap_or("")
             .to_owned();
+        ensure!(
+            content_type.starts_with("application/json")
+                || content_type.starts_with("text/event-stream"),
+            "Arcade MCP response has an unsupported content type"
+        );
         let bytes = bounded_bytes(response, self.max_response_bytes).await?;
         let value = if content_type.starts_with("text/event-stream") {
             parse_sse(&bytes)?
         } else {
             serde_json::from_slice(&bytes).context("decode Arcade MCP response")?
         };
+        validate_mcp_response(
+            &value,
+            expected_id.as_ref().expect("response ID was checked"),
+        )?;
         Ok(McpResponse {
             value: Some(value),
             session_id,
@@ -630,7 +806,7 @@ impl ArcadeGatewayProvider {
 
 #[async_trait]
 impl CapabilityProvider for ArcadeGatewayProvider {
-    fn descriptors(&self, context: &CapabilityContext) -> Vec<CapabilityDescriptor> {
+    fn configured_descriptors(&self, context: &CapabilityContext) -> Vec<CapabilityDescriptor> {
         if !self.visible(context) {
             return Vec::new();
         }
@@ -648,6 +824,35 @@ impl CapabilityProvider for ArcadeGatewayProvider {
                 },
             })
             .collect()
+    }
+
+    async fn descriptors(&self, context: &CapabilityContext) -> Result<Vec<CapabilityDescriptor>> {
+        if !self.visible(context) {
+            return Ok(Vec::new());
+        }
+        let token = self
+            .access_token(context, "arcade.gateway")
+            .await
+            .map_err(|_| anyhow!("Arcade gateway authorization failed"))?;
+        let verified = self
+            .verified_tool_names(&token)
+            .await
+            .map_err(|_| anyhow!("Arcade tool verification failed"))?;
+        Ok(self
+            .tools
+            .values()
+            .filter(|tool| tool.policy != Decision::Deny && verified.contains(&tool.name))
+            .map(|tool| CapabilityDescriptor {
+                name: tool.name.clone(),
+                description: tool.description.clone(),
+                input_schema: tool.input_schema.clone(),
+                policy: if tool.policy == Decision::Ask {
+                    CapabilityPolicy::Ask
+                } else {
+                    CapabilityPolicy::Allow
+                },
+            })
+            .collect())
     }
 
     async fn normalize(
@@ -692,7 +897,7 @@ impl CapabilityProvider for ArcadeGatewayProvider {
             .get(capability)
             .ok_or_else(|| anyhow!("Unknown Arcade capability"))?;
         let token = self
-            .access_token(context)
+            .access_token(context, capability)
             .await
             .map_err(|_| anyhow!("Arcade gateway authorization failed"))?;
         match self.execute(&token, tool, arguments).await {
@@ -705,16 +910,8 @@ impl CapabilityProvider for ArcadeGatewayProvider {
                     .to_string()
                     .trim_start_matches("ARCADE_AUTHORIZATION_REQUIRED:")
                     .to_owned();
-                let events = context
-                    .events
-                    .lock()
-                    .expect("capability event lock")
-                    .clone()
-                    .ok_or_else(|| anyhow!("No active turn can authorize this Arcade tool"))?;
-                events
-                    .status(&format!(
-                        "Arcade tool authorization required. Open this URL, then explicitly retry the operation:\n{url}"
-                    ))
+                context
+                    .authorization_required("arcade", capability, &url)
                     .await?;
                 bail!("Arcade tool authorization is required; retry after authorizing")
             }
@@ -736,47 +933,106 @@ async fn bounded_json<T: for<'de> Deserialize<'de>>(
     serde_json::from_slice(&bytes).context("decode OAuth response")
 }
 
-async fn bounded_bytes(response: reqwest::Response, limit: usize) -> Result<Vec<u8>> {
+async fn bounded_bytes(mut response: reqwest::Response, limit: usize) -> Result<Vec<u8>> {
     if let Some(length) = response.content_length() {
         ensure!(length <= limit as u64, "Arcade response is too large");
     }
-    let bytes = response.bytes().await?;
-    ensure!(bytes.len() <= limit, "Arcade response is too large");
-    Ok(bytes.to_vec())
+    let mut bytes =
+        Vec::with_capacity(response.content_length().unwrap_or(0).min(limit as u64) as usize);
+    while let Some(chunk) = response.chunk().await? {
+        ensure!(
+            bytes.len().saturating_add(chunk.len()) <= limit,
+            "Arcade response is too large"
+        );
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
 }
 
 async fn receive_code(listener: TcpListener, expected_state: &str) -> Result<String> {
-    let (mut stream, _) = listener.accept().await?;
-    let mut bytes = vec![0u8; 16 * 1024];
-    let read = stream.read(&mut bytes).await?;
-    ensure!(read > 0, "Empty OAuth callback");
-    let request = std::str::from_utf8(&bytes[..read]).context("Malformed OAuth callback")?;
-    let target = request
-        .lines()
-        .next()
-        .and_then(|line| line.split_whitespace().nth(1))
-        .ok_or_else(|| anyhow!("Malformed OAuth callback"))?;
-    let callback = Url::parse(&format!("http://127.0.0.1{target}"))?;
+    for _ in 0..8 {
+        let (mut stream, peer) = listener.accept().await?;
+        if !peer.ip().is_loopback() {
+            continue;
+        }
+        let mut bytes = Vec::new();
+        let mut chunk = [0u8; 2048];
+        let valid = loop {
+            let read = stream.read(&mut chunk).await?;
+            if read == 0 {
+                break None;
+            }
+            bytes.extend_from_slice(&chunk[..read]);
+            if bytes.len() > 16 * 1024 {
+                break None;
+            }
+            if bytes.windows(4).any(|window| window == b"\r\n\r\n") {
+                let request = std::str::from_utf8(&bytes).ok();
+                break request.and_then(|request| parse_oauth_callback(request, expected_state));
+            }
+        };
+        if let Some(code) = valid {
+            write_callback_response(
+                &mut stream,
+                200,
+                "Arcade authorization completed. You may close this tab.",
+            )
+            .await?;
+            return Ok(code);
+        }
+        write_callback_response(&mut stream, 400, "Invalid OAuth callback.").await?;
+    }
+    bail!("OAuth callback did not include a valid code and state")
+}
+
+fn parse_oauth_callback(request: &str, expected_state: &str) -> Option<String> {
+    let mut lines = request.split("\r\n");
+    let mut request_line = lines.next()?.split_whitespace();
+    if request_line.next()? != "GET" {
+        return None;
+    }
+    let target = request_line.next()?;
+    if request_line.next()? != "HTTP/1.1" {
+        return None;
+    }
+    let host = lines.find_map(|line| {
+        line.split_once(':')
+            .filter(|(name, _)| name.eq_ignore_ascii_case("host"))
+            .map(|(_, value)| value.trim())
+    })?;
+    if host != "127.0.0.1" && !host.starts_with("127.0.0.1:") {
+        return None;
+    }
+    let callback = Url::parse(&format!("http://127.0.0.1{target}")).ok()?;
+    if callback.path() != "/callback" {
+        return None;
+    }
     let parameters = callback.query_pairs().collect::<BTreeMap<_, _>>();
-    ensure!(
-        parameters.get("state").map(|value| value.as_ref()) == Some(expected_state),
-        "OAuth state mismatch"
-    );
-    let code = parameters
+    if parameters.get("state").map(|value| value.as_ref()) != Some(expected_state) {
+        return None;
+    }
+    parameters
         .get("code")
-        .map(|value| value.to_string())
-        .ok_or_else(|| anyhow!("OAuth callback did not include a code"))?;
-    let body = "Arcade authorization completed. You may close this tab.";
+        .filter(|code| !code.is_empty())
+        .map(ToString::to_string)
+}
+
+async fn write_callback_response(
+    stream: &mut tokio::net::TcpStream,
+    status: u16,
+    body: &str,
+) -> Result<()> {
     stream
         .write_all(
             format!(
-                "HTTP/1.1 200 OK\r\ncontent-type: text/plain; charset=utf-8\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                "HTTP/1.1 {status} {}\r\ncontent-type: text/plain; charset=utf-8\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                if status == 200 { "OK" } else { "Bad Request" },
                 body.len()
             )
             .as_bytes(),
         )
         .await?;
-    Ok(code)
+    Ok(())
 }
 
 fn bearer_parameter(header: &str, name: &str) -> Option<String> {
@@ -788,7 +1044,15 @@ fn bearer_parameter(header: &str, name: &str) -> Option<String> {
 
 fn ensure_trusted_oauth_url(value: &str) -> Result<()> {
     let url = Url::parse(value)?;
-    ensure!(url.scheme() == "https", "OAuth endpoint must use HTTPS");
+    #[cfg(test)]
+    let test_loopback =
+        url.scheme() == "http" && url.host_str().is_some_and(|host| host == "127.0.0.1");
+    #[cfg(not(test))]
+    let test_loopback = false;
+    ensure!(
+        url.scheme() == "https" || test_loopback,
+        "OAuth endpoint must use HTTPS"
+    );
     ensure!(
         url.username().is_empty() && url.password().is_none(),
         "OAuth URL contains credentials"
@@ -796,8 +1060,8 @@ fn ensure_trusted_oauth_url(value: &str) -> Result<()> {
     ensure!(url.fragment().is_none(), "OAuth URL contains a fragment");
     let host = url.host_str().unwrap_or_default();
     ensure!(
-        host == "arcade.dev" || host.ends_with(".arcade.dev"),
-        "OAuth endpoint is outside Arcade"
+        test_loopback || TRUSTED_ARCADE_HOSTS.contains(&host),
+        "OAuth endpoint is outside the reviewed Arcade origins"
     );
     Ok(())
 }
@@ -818,49 +1082,115 @@ fn now_unix() -> Result<u64> {
     Ok(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs())
 }
 
+fn validate_mcp_response(value: &Value, expected_id: &Value) -> Result<()> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| anyhow!("Arcade MCP response is not an object"))?;
+    ensure!(
+        object.get("jsonrpc") == Some(&Value::String("2.0".into())),
+        "Arcade MCP response has an invalid JSON-RPC version"
+    );
+    ensure!(
+        !object.contains_key("method"),
+        "Arcade sent an unsupported server request or notification"
+    );
+    ensure!(
+        object.get("id") == Some(expected_id),
+        "Arcade MCP response ID mismatch"
+    );
+    ensure!(
+        object.contains_key("result") ^ object.contains_key("error"),
+        "Arcade MCP response must contain exactly one result or error"
+    );
+    Ok(())
+}
+
 fn parse_sse(bytes: &[u8]) -> Result<Value> {
     let text = std::str::from_utf8(bytes).context("Arcade SSE is not UTF-8")?;
-    for line in text.lines() {
-        if let Some(data) = line.strip_prefix("data:") {
-            return serde_json::from_str(data.trim()).context("decode Arcade SSE data");
+    let mut events = Vec::new();
+    let mut data = Vec::new();
+    for line in text.lines().chain(std::iter::once("")) {
+        if line.is_empty() {
+            if !data.is_empty() {
+                events.push(data.join("\n"));
+                data.clear();
+            }
+        } else if let Some(value) = line.strip_prefix("data:") {
+            data.push(value.trim_start().to_owned());
+        } else if !line.starts_with(':') && !line.starts_with("event:") && !line.starts_with("id:")
+        {
+            bail!("Arcade SSE response contains an unsupported field");
         }
     }
-    bail!("Arcade SSE response has no data event")
+    ensure!(
+        events.len() == 1,
+        "Arcade SSE response must contain exactly one data event"
+    );
+    serde_json::from_str(&events[0]).context("decode Arcade SSE data")
 }
 
 fn find_arcade_authorization_url(value: &Value) -> Option<String> {
-    match value {
-        Value::String(text) => text.split_whitespace().find_map(|word| {
-            let candidate = word.trim_matches(|character: char| {
-                matches!(character, '"' | '\'' | '(' | ')' | '<' | '>' | ',' | '.')
-            });
-            ensure_trusted_oauth_url(candidate)
-                .ok()
-                .map(|_| candidate.to_owned())
-        }),
-        Value::Array(values) => values.iter().find_map(find_arcade_authorization_url),
-        Value::Object(values) => values.values().find_map(find_arcade_authorization_url),
-        _ => None,
+    fn validated(value: &Value) -> Option<String> {
+        let candidate = value.as_str()?;
+        ensure_trusted_oauth_url(candidate)
+            .ok()
+            .map(|_| candidate.to_owned())
     }
+
+    let object = value.as_object()?;
+    for pointer in [
+        "/error/data/authorization_url",
+        "/error/data/authorizationUrl",
+        "/result/_meta/authorization_url",
+        "/result/_meta/authorizationUrl",
+    ] {
+        if let Some(url) = value.pointer(pointer).and_then(validated) {
+            return Some(url);
+        }
+    }
+    object
+        .get("error")
+        .and_then(Value::as_object)
+        .and_then(|error| error.get("data"))
+        .and_then(Value::as_object)
+        .and_then(|data| data.get("url"))
+        .and_then(validated)
 }
 
 fn validate_schema(value: &Value, schema: &Value, path: &str) -> Result<()> {
+    validate_schema_at(value, schema, path, 0)
+}
+
+fn validate_schema_at(value: &Value, schema: &Value, path: &str, depth: usize) -> Result<()> {
+    ensure!(depth <= 16, "{path} is too deeply nested");
+    if let Some(expected) = schema.get("const") {
+        ensure!(
+            value == expected,
+            "{path} does not match its constant value"
+        );
+    }
+    if let Some(allowed) = schema.get("enum").and_then(Value::as_array) {
+        ensure!(
+            allowed.contains(value),
+            "{path} is outside its allowed values"
+        );
+    }
     match schema.get("type").and_then(Value::as_str) {
         Some("object") => {
             let object = value
                 .as_object()
                 .ok_or_else(|| anyhow!("{path} must be an object"))?;
+            ensure!(object.len() <= 10_000, "{path} contains too many fields");
             let properties = schema
                 .get("properties")
                 .and_then(Value::as_object)
                 .cloned()
                 .unwrap_or_default();
-            if schema.get("additionalProperties") == Some(&Value::Bool(false)) {
-                ensure!(
-                    object.keys().all(|key| properties.contains_key(key)),
-                    "{path} contains unknown fields"
-                );
-            }
+            ensure!(
+                object.keys().all(|key| properties.contains_key(key)),
+                "{path} contains unknown fields"
+            );
+            validate_size(object.len(), schema, "minProperties", "maxProperties", path)?;
             if let Some(required) = schema.get("required").and_then(Value::as_array) {
                 for name in required.iter().filter_map(Value::as_str) {
                     ensure!(object.contains_key(name), "{path}.{name} is required");
@@ -868,7 +1198,7 @@ fn validate_schema(value: &Value, schema: &Value, path: &str) -> Result<()> {
             }
             for (name, child) in object {
                 if let Some(child_schema) = properties.get(name) {
-                    validate_schema(child, child_schema, &format!("{path}.{name}"))?;
+                    validate_schema_at(child, child_schema, &format!("{path}.{name}"), depth + 1)?;
                 }
             }
         }
@@ -876,155 +1206,128 @@ fn validate_schema(value: &Value, schema: &Value, path: &str) -> Result<()> {
             let string = value
                 .as_str()
                 .ok_or_else(|| anyhow!("{path} must be a string"))?;
-            if let Some(maximum) = schema.get("maxLength").and_then(Value::as_u64) {
-                ensure!(
-                    string.chars().count() <= maximum as usize,
-                    "{path} is too long"
-                );
-            }
+            validate_size(
+                string.chars().count(),
+                schema,
+                "minLength",
+                "maxLength",
+                path,
+            )?;
         }
         Some("integer") => {
             let integer = value
                 .as_i64()
                 .ok_or_else(|| anyhow!("{path} must be an integer"))?;
-            if let Some(minimum) = schema.get("minimum").and_then(Value::as_i64) {
-                ensure!(integer >= minimum, "{path} is below its minimum");
-            }
+            validate_number(integer as f64, schema, path)?;
         }
-        Some("number") => ensure!(value.is_number(), "{path} must be a number"),
+        Some("number") => {
+            let number = value
+                .as_f64()
+                .ok_or_else(|| anyhow!("{path} must be a number"))?;
+            validate_number(number, schema, path)?;
+        }
         Some("boolean") => ensure!(value.is_boolean(), "{path} must be a boolean"),
+        Some("null") => ensure!(value.is_null(), "{path} must be null"),
         Some("array") => {
             let values = value
                 .as_array()
                 .ok_or_else(|| anyhow!("{path} must be an array"))?;
-            if let Some(items) = schema.get("items") {
-                for (index, child) in values.iter().enumerate() {
-                    validate_schema(child, items, &format!("{path}[{index}]"))?;
-                }
+            ensure!(values.len() <= 10_000, "{path} contains too many items");
+            validate_size(values.len(), schema, "minItems", "maxItems", path)?;
+            let items = schema
+                .get("items")
+                .ok_or_else(|| anyhow!("{path} has no item schema"))?;
+            for (index, child) in values.iter().enumerate() {
+                validate_schema_at(child, items, &format!("{path}[{index}]"), depth + 1)?;
             }
         }
         Some(other) => bail!("Unsupported schema type {other}"),
-        None => {}
+        None => bail!("{path} has no schema type"),
     }
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[derive(Default)]
-    struct MemoryStore(Mutex<HashMap<String, Vec<u8>>>);
-    impl SecretStore for MemoryStore {
-        fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
-            Ok(self.0.lock().unwrap().get(key).cloned())
-        }
-        fn set(&self, key: &str, value: &[u8]) -> Result<()> {
-            self.0.lock().unwrap().insert(key.into(), value.into());
-            Ok(())
-        }
-        fn delete(&self, key: &str) -> Result<()> {
-            self.0.lock().unwrap().remove(key);
-            Ok(())
-        }
-    }
-
-    fn config() -> ArcadeConnectorConfig {
-        ArcadeConnectorConfig {
-            gateway_slug: "test-gateway".into(),
-            request_timeout_ms: 30_000,
-            max_calls_per_job: 3,
-            max_request_bytes: 1024,
-            max_response_bytes: 4096,
-            tools: vec![ArcadeToolConfig {
-                name: "arcade.issue".into(),
-                upstream_name: "GitHub.GetIssue".into(),
-                description: "Read one issue".into(),
-                input_schema: json!({
-                    "type": "object",
-                    "properties": { "number": { "type": "integer", "minimum": 1 } },
-                    "required": ["number"],
-                    "additionalProperties": false
-                }),
-                policy: Decision::Allow,
-            }],
-        }
-    }
-
-    fn context(ingress: &str) -> CapabilityContext {
-        CapabilityContext {
-            job_id: "job".into(),
-            ingress_id: ingress.into(),
-            principal_id: "principal".into(),
-            conversation_id: "conversation".into(),
-            repository: "app".into(),
-            events: Arc::new(Mutex::new(None)),
-        }
-    }
-
-    #[tokio::test]
-    async fn exposes_only_curated_tools_to_local_jobs_and_normalizes_arguments() {
-        let provider =
-            ArcadeGatewayProvider::new(config(), Arc::new(MemoryStore::default())).unwrap();
-        assert_eq!(
-            provider.descriptors(&context("cli"))[0].name,
-            "arcade.issue"
-        );
-        assert!(provider.descriptors(&context("signal")).is_empty());
-        assert!(
-            provider
-                .normalize(&context("cli"), "arcade.issue", json!({"number": 1}))
-                .await
-                .is_ok()
-        );
-        assert!(
-            provider
-                .normalize(&context("cli"), "arcade.issue", json!({"number": 0}))
-                .await
-                .is_err()
-        );
-        assert!(
-            provider
-                .normalize(
-                    &context("cli"),
-                    "arcade.issue",
-                    json!({"number": 1, "host": "evil"})
-                )
-                .await
-                .is_err()
+fn validate_size(
+    actual: usize,
+    schema: &Value,
+    minimum_name: &str,
+    maximum_name: &str,
+    path: &str,
+) -> Result<()> {
+    if let Some(minimum) = schema.get(minimum_name).and_then(Value::as_u64) {
+        ensure!(
+            actual >= minimum as usize,
+            "{path} is below its minimum size"
         );
     }
-
-    #[test]
-    fn validates_closed_tool_arguments_and_redacts_non_arcade_urls() {
-        let schema = json!({
-            "type": "object",
-            "properties": { "owner": { "type": "string", "maxLength": 5 }, "number": { "type": "integer", "minimum": 1 } },
-            "required": ["owner", "number"],
-            "additionalProperties": false
-        });
-        validate_schema(&json!({"owner":"acme","number":1}), &schema, "arguments").unwrap();
-        assert!(
-            validate_schema(&json!({"owner":"acme","number":0}), &schema, "arguments").is_err()
+    if let Some(maximum) = schema.get(maximum_name).and_then(Value::as_u64) {
+        ensure!(
+            actual <= maximum as usize,
+            "{path} exceeds its maximum size"
         );
-        assert!(
-            validate_schema(
-                &json!({"owner":"acme","number":1,"url":"https://evil.test"}),
-                &schema,
-                "arguments"
-            )
-            .is_err()
-        );
-        assert_eq!(
-            find_arcade_authorization_url(&json!({"url":"https://cloud.arcade.dev/auth/x"}))
-                .as_deref(),
-            Some("https://cloud.arcade.dev/auth/x")
-        );
-        assert!(find_arcade_authorization_url(&json!({"url":"https://evil.test/auth"})).is_none());
-        let store = MemoryStore::default();
-        store.set("one", b"secret").unwrap();
-        assert_eq!(store.get("one").unwrap().unwrap(), b"secret");
-        store.delete("one").unwrap();
-        assert!(store.get("one").unwrap().is_none());
     }
+    Ok(())
 }
+
+fn validate_number(number: f64, schema: &Value, path: &str) -> Result<()> {
+    if let Some(minimum) = schema.get("minimum").and_then(Value::as_f64) {
+        ensure!(number >= minimum, "{path} is below its minimum");
+    }
+    if let Some(maximum) = schema.get("maximum").and_then(Value::as_f64) {
+        ensure!(number <= maximum, "{path} exceeds its maximum");
+    }
+    Ok(())
+}
+
+fn project_result(value: &Value, schema: &Value, path: &str) -> Result<Value> {
+    fn project(value: &Value, schema: &Value, path: &str, depth: usize) -> Result<Value> {
+        ensure!(depth <= 16, "{path} is too deeply nested");
+        match schema.get("type").and_then(Value::as_str) {
+            Some("object") => {
+                let source = value
+                    .as_object()
+                    .ok_or_else(|| anyhow!("{path} must be an object"))?;
+                let properties = schema
+                    .get("properties")
+                    .and_then(Value::as_object)
+                    .ok_or_else(|| anyhow!("{path} has no projected properties"))?;
+                let mut projected = serde_json::Map::new();
+                for (name, child_schema) in properties {
+                    if let Some(child) = source.get(name) {
+                        projected.insert(
+                            name.clone(),
+                            project(child, child_schema, &format!("{path}.{name}"), depth + 1)?,
+                        );
+                    }
+                }
+                Ok(Value::Object(projected))
+            }
+            Some("array") => {
+                let values = value
+                    .as_array()
+                    .ok_or_else(|| anyhow!("{path} must be an array"))?;
+                ensure!(values.len() <= 10_000, "{path} contains too many items");
+                let items = schema
+                    .get("items")
+                    .ok_or_else(|| anyhow!("{path} has no item schema"))?;
+                values
+                    .iter()
+                    .enumerate()
+                    .map(|(index, child)| {
+                        project(child, items, &format!("{path}[{index}]"), depth + 1)
+                    })
+                    .collect::<Result<Vec<_>>>()
+                    .map(Value::Array)
+            }
+            Some(_) => Ok(value.clone()),
+            None => bail!("{path} has no schema type"),
+        }
+    }
+
+    let projected = project(value, schema, path, 0)?;
+    validate_schema(&projected, schema, path)?;
+    Ok(projected)
+}
+
+#[cfg(test)]
+mod tests;

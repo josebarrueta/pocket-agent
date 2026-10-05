@@ -59,7 +59,9 @@ pub struct ArcadeToolConfig {
     pub name: String,
     pub upstream_name: String,
     pub description: String,
+    pub upstream_input_schema: serde_json::Value,
     pub input_schema: serde_json::Value,
+    pub output_schema: serde_json::Value,
     #[serde(default = "default_allow")]
     pub policy: Decision,
 }
@@ -335,20 +337,171 @@ fn validate_arcade(arcade: &ArcadeConnectorConfig) -> Result<()> {
             "Arcade tool description is invalid"
         );
         ensure!(
+            tool.upstream_input_schema.is_object(),
+            "Arcade upstream input schemas must be JSON objects"
+        );
+        validate_local_schema(&tool.input_schema, "Arcade input schema", 0)?;
+        ensure!(
             tool.input_schema
                 .get("type")
                 .and_then(|value| value.as_str())
-                == Some("object")
-                && tool
-                    .input_schema
-                    .get("additionalProperties")
-                    .and_then(|value| value.as_bool())
-                    == Some(false),
-            "Arcade input schemas must be closed object schemas"
+                == Some("object"),
+            "Arcade input schemas must describe objects"
         );
+        validate_local_schema(&tool.output_schema, "Arcade output schema", 0)?;
         ensure!(
             local.insert(tool.name.clone()) && upstream.insert(tool.upstream_name.clone()),
             "Arcade tool names must be unique"
+        );
+    }
+    Ok(())
+}
+
+fn validate_local_schema(schema: &serde_json::Value, path: &str, depth: usize) -> Result<()> {
+    ensure!(depth <= 16, "{path} is too deeply nested");
+    let object = schema
+        .as_object()
+        .ok_or_else(|| anyhow!("{path} must be a JSON object"))?;
+    let schema_type = object
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow!("{path}.type is required"))?;
+    ensure!(
+        matches!(
+            schema_type,
+            "object" | "array" | "string" | "integer" | "number" | "boolean" | "null"
+        ),
+        "{path}.type is unsupported"
+    );
+    let allowed_common = [
+        "type",
+        "title",
+        "description",
+        "default",
+        "examples",
+        "enum",
+        "const",
+    ];
+    let allowed_specific: &[&str] = match schema_type {
+        "object" => &[
+            "properties",
+            "required",
+            "additionalProperties",
+            "minProperties",
+            "maxProperties",
+        ],
+        "array" => &["items", "minItems", "maxItems"],
+        "string" => &["minLength", "maxLength"],
+        "integer" | "number" => &["minimum", "maximum"],
+        "boolean" | "null" => &[],
+        _ => unreachable!(),
+    };
+    ensure!(
+        object
+            .keys()
+            .all(|key| allowed_common.contains(&key.as_str())
+                || allowed_specific.contains(&key.as_str())),
+        "{path} contains an unsupported JSON Schema keyword"
+    );
+    if let Some(values) = object.get("enum") {
+        let values = values
+            .as_array()
+            .ok_or_else(|| anyhow!("{path}.enum must be an array"))?;
+        ensure!(
+            !values.is_empty() && values.len() <= 256,
+            "{path}.enum is invalid"
+        );
+    }
+    match schema_type {
+        "object" => {
+            ensure!(
+                object.get("additionalProperties") == Some(&serde_json::Value::Bool(false)),
+                "{path} object schemas must set additionalProperties to false"
+            );
+            let properties = object
+                .get("properties")
+                .and_then(serde_json::Value::as_object)
+                .ok_or_else(|| anyhow!("{path}.properties must be an object"))?;
+            for (name, child) in properties {
+                validate_local_schema(child, &format!("{path}.properties.{name}"), depth + 1)?;
+            }
+            if let Some(required) = object.get("required") {
+                let required = required
+                    .as_array()
+                    .ok_or_else(|| anyhow!("{path}.required must be an array"))?;
+                let mut names = std::collections::BTreeSet::new();
+                for name in required {
+                    let name = name
+                        .as_str()
+                        .ok_or_else(|| anyhow!("{path}.required entries must be strings"))?;
+                    ensure!(
+                        properties.contains_key(name),
+                        "{path}.required names an unknown property"
+                    );
+                    ensure!(names.insert(name), "{path}.required contains duplicates");
+                }
+            }
+            validate_u64_range(object, "minProperties", "maxProperties", path)?;
+        }
+        "array" => {
+            let items = object
+                .get("items")
+                .ok_or_else(|| anyhow!("{path}.items is required"))?;
+            validate_local_schema(items, &format!("{path}.items"), depth + 1)?;
+            validate_u64_range(object, "minItems", "maxItems", path)?;
+        }
+        "string" => validate_u64_range(object, "minLength", "maxLength", path)?,
+        "integer" | "number" => {
+            let minimum = object.get("minimum").and_then(serde_json::Value::as_f64);
+            let maximum = object.get("maximum").and_then(serde_json::Value::as_f64);
+            ensure!(
+                object.get("minimum").is_none() || minimum.is_some(),
+                "{path}.minimum must be a number"
+            );
+            ensure!(
+                object.get("maximum").is_none() || maximum.is_some(),
+                "{path}.maximum must be a number"
+            );
+            ensure!(
+                minimum.zip(maximum).is_none_or(|(min, max)| min <= max),
+                "{path} has an invalid numeric range"
+            );
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn validate_u64_range(
+    object: &serde_json::Map<String, serde_json::Value>,
+    minimum_name: &str,
+    maximum_name: &str,
+    path: &str,
+) -> Result<()> {
+    let minimum = object
+        .get(minimum_name)
+        .map(|value| {
+            value
+                .as_u64()
+                .ok_or_else(|| anyhow!("{path}.{minimum_name} must be a non-negative integer"))
+        })
+        .transpose()?;
+    let maximum = object
+        .get(maximum_name)
+        .map(|value| {
+            value
+                .as_u64()
+                .ok_or_else(|| anyhow!("{path}.{maximum_name} must be a non-negative integer"))
+        })
+        .transpose()?;
+    ensure!(
+        minimum.zip(maximum).is_none_or(|(min, max)| min <= max),
+        "{path} has an invalid size range"
+    );
+    if let Some(maximum) = maximum {
+        ensure!(
+            maximum > 0 && maximum <= 1_000_000,
+            "{path}.{maximum_name} is out of range"
         );
     }
     Ok(())
@@ -460,8 +613,26 @@ mod tests {
     }
 
     #[test]
+    fn separates_upstream_schema_pinning_from_local_argument_policy() {
+        let arcade = r#""connectors":{"arcade":{"gatewaySlug":"dev-gateway","tools":[{"name":"arcade.github_get_issue","upstreamName":"GitHub.GetIssue","description":"Read one issue.","upstreamInputSchema":{"type":"object","properties":{"number":{"type":"integer"}}},"inputSchema":{"type":"object","properties":{"number":{"type":"integer","minimum":1,"maximum":1000}},"required":["number"],"additionalProperties":false},"outputSchema":{"type":"object","properties":{"title":{"type":"string","maxLength":256}},"required":["title"],"additionalProperties":false},"policy":"allow"}]}},"#;
+        let configured =
+            valid("").replace("\"repositories\":", &format!("{arcade}\"repositories\":"));
+        let config = load(&configured).unwrap();
+        let tool = &config.connectors.arcade.unwrap().tools[0];
+        assert_eq!(
+            tool.upstream_input_schema["additionalProperties"],
+            serde_json::Value::Null
+        );
+        assert_eq!(tool.input_schema["additionalProperties"], false);
+        assert_eq!(tool.output_schema["additionalProperties"], false);
+
+        assert!(load(&configured.replace("\"maximum\":1000", "\"pattern\":\".*\"")).is_err());
+        assert!(load(&configured.replace("\"maxLength\":256", "\"maxLength\":0")).is_err());
+    }
+
+    #[test]
     fn validates_slug_only_curated_arcade_configuration() {
-        let arcade = r#""connectors":{"arcade":{"gatewaySlug":"dev-gateway","tools":[{"name":"arcade.github_get_issue","upstreamName":"GitHub.GetIssue","description":"Read one issue.","inputSchema":{"type":"object","properties":{"number":{"type":"integer","minimum":1}},"required":["number"],"additionalProperties":false},"policy":"allow"}]}},"#;
+        let arcade = r#""connectors":{"arcade":{"gatewaySlug":"dev-gateway","tools":[{"name":"arcade.github_get_issue","upstreamName":"GitHub.GetIssue","description":"Read one issue.","upstreamInputSchema":{"type":"object","properties":{"number":{"type":"integer","minimum":1}},"required":["number"]},"inputSchema":{"type":"object","properties":{"number":{"type":"integer","minimum":1}},"required":["number"],"additionalProperties":false},"outputSchema":{"type":"object","properties":{"title":{"type":"string","maxLength":256}},"required":["title"],"additionalProperties":false},"policy":"allow"}]}},"#;
         let configured =
             valid("").replace("\"repositories\":", &format!("{arcade}\"repositories\":"));
         let config = load(&configured).unwrap();

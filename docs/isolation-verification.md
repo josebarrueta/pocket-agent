@@ -16,10 +16,12 @@ Native Linux is required for Docker private host Unix-socket tests. GitHub Actio
 | Job credentials cannot be replayed, altered, reused across jobs, or used after expiry/revocation | Capability and model proxy unit tests |
 | Approvals bind one normalized operation and cancellation wins races | Harness approval scope tests and capability post-approval reauthentication |
 | Traversal, links, hard links, submodules, binary/rename patches, oversize input, and target-link races fail closed | Rust workspace submission, export, scanner, and application tests |
-| Provider and connector credentials do not enter worker environment, arguments, files, events, or audit records | Docker environment/argument inspection, active boundary probes, and redacted proxy/broker audit tests |
+| Provider and connector credentials do not enter worker environment, arguments, files, events, or audit records | Docker environment/argument inspection, active boundary probes, redacted proxy/broker audit tests, and fake Arcade OAuth/MCP tests |
+| Arcade discovery, DCR/PKCE callback, restart persistence, refresh rotation, strict MCP IDs/sessions, schema verification, output projection, response limits, and explicit authorization retry fail closed | Fake loopback OAuth and Streamable HTTP gateway tests in `rust/arcade/tests.rs`; ignored interactive live-gateway test |
 | Model/provider/destination scope, usage attribution, token/rate/concurrency limits, timeout, and streaming cancellation are enforced | Rust model proxy tests and native-Linux real-worker proxy integration |
 | Broker/model outages fail closed without granting general network access | Networkless worker configuration, authenticated socket handling, and worker failure cleanup tests |
-| Hangs, ignored cancellation, worker crashes, fork/memory/disk pressure, and huge output are contained and reclaimed | Rust Docker lifecycle, pressure, byte-limit, and orphan tests |
+| Hangs, ignored cancellation, worker crashes, fork/memory/disk pressure, and huge output are contained and reclaimed | Rust Docker lifecycle, pressure, byte-limit, and orphan tests; native protocol frames are incrementally bounded |
+| Native macOS is never selected for remote or unattended ingress because it cannot guarantee cleanup of descendants that create a new process session | Startup rejects Signal with the native runner; limitation documented in `native-macos-sandbox.md` |
 | Duplicate or stale activity cannot cross a run/job boundary | Versioned run identity validation and single-active-turn enforcement in `rust/docker.rs` and harness tests |
 | Restart cleanup removes orphan containers, volumes, and stale disposable workspaces | Rust Docker reconciliation and workspace reclamation tests; startup invokes both |
 | Cancellation, timeout, protocol violation, failed worker exit, and host shutdown revoke access and destroy resources | Rust Docker lifecycle tests and synchronous lease revocation |

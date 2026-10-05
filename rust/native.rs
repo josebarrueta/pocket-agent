@@ -13,7 +13,7 @@ use anyhow::{Context, Result, anyhow, bail, ensure};
 use async_trait::async_trait;
 use serde_json::{Value, json};
 use tokio::{
-    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, Lines},
+    io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     process::{Child, ChildStderr, ChildStdin, ChildStdout, Command},
     sync::{Mutex, OnceCell},
     time::{Instant, timeout, timeout_at},
@@ -155,7 +155,7 @@ impl JobFactory for NativeJobFactory {
 struct WorkerProcess {
     child: Mutex<Child>,
     stdin: Mutex<ChildStdin>,
-    lines: Mutex<Lines<BufReader<ChildStdout>>>,
+    stdout: Mutex<BufReader<ChildStdout>>,
     stderr: Mutex<Option<ChildStderr>>,
     pid: u32,
 }
@@ -203,9 +203,9 @@ impl JobHandle for NativeJob {
                 "deadlineAt": deadline_timestamp(self.limits.job_timeout)?, "outputLimitBytes": self.limits.output_bytes,
             })).await?;
             let mut bytes = 0usize;
-            let mut lines = process.lines.lock().await;
+            let mut stdout = process.stdout.lock().await;
             loop {
-                let line = timeout_at(deadline, lines.next_line()).await
+                let line = timeout_at(deadline, read_bounded_line(&mut *stdout, MAX_PROTOCOL_BYTES)).await
                     .map_err(|_| anyhow!("sandbox job deadline exceeded"))??;
                 let Some(line) = line else {
                     let mut diagnostics = Vec::new();
@@ -219,7 +219,7 @@ impl JobHandle for NativeJob {
                     bail!("worker control channel closed: {}", String::from_utf8_lossy(&diagnostics).trim());
                 };
                 bytes = bytes.checked_add(line.len() + 1).ok_or_else(|| anyhow!("protocol output overflow"))?;
-                ensure!(line.len() <= MAX_PROTOCOL_BYTES && bytes <= self.limits.output_bytes + 1024 * 1024, "worker protocol output exceeded its limit");
+                ensure!(bytes <= self.limits.output_bytes + 1024 * 1024, "worker protocol output exceeded its limit");
                 let message: Value = serde_json::from_str(&line).context("worker sent malformed JSON")?;
                 if message.get("protocolVersion").and_then(Value::as_u64) != Some(PROTOCOL_VERSION)
                     || message.get("jobId").and_then(Value::as_str) != Some(&self.id)
@@ -242,15 +242,15 @@ impl JobHandle for NativeJob {
                         let output = required_string(&message, "output")?;
                         ensure!(output.len() <= self.limits.output_bytes, "worker output exceeded its limit");
                         let output = output.to_owned();
-                        drop(lines);
+                        drop(stdout);
                         let changed_files = self.capture_patch().await?;
                         return Ok(TurnResult { output, changed_files });
                     }
                     Some("failure") => {
                         let failure = required_string(&message, "message")?.to_owned();
-                        drop(lines); self.dispose().await; bail!(failure);
+                        drop(stdout); self.dispose().await; bail!(failure);
                     }
-                    _ => { drop(lines); self.dispose().await; bail!("worker sent an invalid protocol message"); }
+                    _ => { drop(stdout); self.dispose().await; bail!("worker sent an invalid protocol message"); }
                 }
             }
         }.await;
@@ -353,10 +353,15 @@ impl NativeJob {
             .take()
             .ok_or_else(|| anyhow!("worker stdout unavailable"))?;
         let mut stderr = child.stderr.take();
-        let mut lines = BufReader::new(stdout).lines();
-        let hello = match timeout(Duration::from_secs(5), lines.next_line()).await {
+        let mut stdout = BufReader::new(stdout);
+        let hello = match timeout(
+            Duration::from_secs(5),
+            read_bounded_line(&mut stdout, MAX_PROTOCOL_BYTES),
+        )
+        .await
+        {
             Err(_) => bail!("worker protocol handshake timed out"),
-            Ok(Err(error)) => return Err(error.into()),
+            Ok(Err(error)) => return Err(error),
             Ok(Ok(None)) => {
                 let mut diagnostics = Vec::new();
                 if let Some(stderr) = stderr.as_mut() {
@@ -387,7 +392,7 @@ impl NativeJob {
         let process = WorkerProcess {
             child: Mutex::new(child),
             stdin: Mutex::new(stdin),
-            lines: Mutex::new(lines),
+            stdout: Mutex::new(stdout),
             stderr: Mutex::new(stderr),
             pid,
         };
@@ -536,6 +541,46 @@ fn sandbox_profile(
     Ok(profile)
 }
 
+async fn read_bounded_line<R: AsyncBufRead + Unpin>(
+    reader: &mut R,
+    maximum: usize,
+) -> Result<Option<String>> {
+    let mut bytes = Vec::new();
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            if bytes.is_empty() {
+                return Ok(None);
+            }
+            break;
+        }
+        let consumed = available
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(available.len(), |position| position + 1);
+        ensure!(
+            bytes.len().saturating_add(consumed) <= maximum.saturating_add(1),
+            "worker protocol line exceeded its limit"
+        );
+        bytes.extend_from_slice(&available[..consumed]);
+        reader.consume(consumed);
+        if bytes.last() == Some(&b'\n') {
+            bytes.pop();
+            if bytes.last() == Some(&b'\r') {
+                bytes.pop();
+            }
+            break;
+        }
+    }
+    ensure!(
+        bytes.len() <= maximum,
+        "worker protocol line exceeded its limit"
+    );
+    Ok(Some(
+        String::from_utf8(bytes).context("worker protocol line is not UTF-8")?,
+    ))
+}
+
 async fn write_message(stdin: &Mutex<ChildStdin>, message: &Value) -> Result<()> {
     let mut stdin = stdin.lock().await;
     let mut payload = serde_json::to_vec(message)?;
@@ -561,4 +606,32 @@ fn revoke(leases: &[Arc<dyn WorkerLease>]) {
 fn deadline_timestamp(duration: Duration) -> Result<String> {
     let deadline = time::OffsetDateTime::now_utc() + time::Duration::try_from(duration)?;
     Ok(deadline.format(&time::format_description::well_known::Rfc3339)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn protocol_lines_are_rejected_before_exceeding_the_frame_limit() {
+        let oversized = vec![b'x'; 1025];
+        let mut reader = BufReader::new(oversized.as_slice());
+        assert!(read_bounded_line(&mut reader, 1024).await.is_err());
+
+        let mut reader = BufReader::new(&b"message\r\nnext\n"[..]);
+        assert_eq!(
+            read_bounded_line(&mut reader, 1024)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("message")
+        );
+        assert_eq!(
+            read_bounded_line(&mut reader, 1024)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("next")
+        );
+    }
 }

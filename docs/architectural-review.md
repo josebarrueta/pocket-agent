@@ -28,7 +28,7 @@ Pi is the first agent runtime, not part of the trusted product boundary. Another
 
 The operator, trusted configuration, Rust host, repository originals, provider credentials, and connector credentials are trusted. Prompts, repository contents, model output, agent runtimes, MCP clients, generated code, and every agent-selected command are untrusted.
 
-No sandbox is “complete.” Kernel, sandbox-runtime, daemon, host-process, and dependency compromise remain outside the boundary. Each runner must state its actual guarantees. The Docker runner is the hardened unattended baseline. The native macOS runner is a convenience boundary with shared host UID and weaker resource containment; it must not silently weaken or replace Docker guarantees.
+No sandbox is “complete.” Kernel, sandbox-runtime, daemon, host-process, and dependency compromise remain outside the boundary. Each runner must state its actual guarantees. The Docker runner is the hardened unattended baseline. The native macOS runner is a local-interactive convenience boundary with shared host UID, weaker resource containment, and no guaranteed cleanup for descendants that create a new process session; it is not admitted for remote or unattended ingress and must not silently weaken or replace Docker guarantees.
 
 ## Non-negotiable invariants
 
@@ -59,7 +59,7 @@ A new sandbox runner is an adapter, not a relaxation of policy. Before it can be
 - platform and kernel assumptions;
 - known differences from the hardened baseline.
 
-A runner that cannot enforce an invariant must fail startup or be explicitly classified as a weaker convenience runner. Marketing, defaults, and unattended deployment guidance must reflect that classification.
+A runner that cannot enforce an invariant must fail startup for affected deployment modes or be explicitly classified and technically restricted as a weaker convenience runner. Marketing, defaults, and unattended deployment guidance must reflect that classification.
 
 ## Feature admission rule
 

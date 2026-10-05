@@ -2,7 +2,7 @@
 
 The trusted Rust host runs a deny-by-default MCP capability broker behind the small `WorkerAccessIssuer`/`WorkerLease` seam. It creates one short-lived job lease for the Docker adapter and serves authenticated MCP requests over a private Unix socket.
 
-Workers cannot add tools or change policy. The broker always exposes the curated workspace tools documented in [`workspaces.md`](workspaces.md) and can expose an explicitly configured set of Arcade Gateway tools through the host-side `CapabilityProvider` seam. There is no worker-facing registration, generic host execution surface, arbitrary endpoint, or MCP passthrough. The Arcade provider design is recorded in [`stories/add-curated-mcp-connector.md`](stories/add-curated-mcp-connector.md), with primary-source protocol and authentication findings in [`arcade-mcp-research.md`](arcade-mcp-research.md).
+Workers cannot add tools or change policy. The broker always exposes the curated workspace tools documented in [`workspaces.md`](workspaces.md) and can expose an explicitly configured set of Arcade Gateway tools through the host-side `CapabilityProvider` seam. Provider enumeration is asynchronous so Arcade tools are shown only after their pinned upstream names and schemas have been verified; configured local descriptors remain separate from this discovery and are used to reject malformed calls before any provider network request. There is no worker-facing registration, generic host execution surface, arbitrary endpoint, or MCP passthrough. The Arcade provider design is recorded in [`stories/add-curated-mcp-connector.md`](stories/add-curated-mcp-connector.md), with primary-source protocol and authentication findings in [`arcade-mcp-research.md`](arcade-mcp-research.md).
 
 ## Private transport
 
@@ -26,7 +26,7 @@ For every call the broker authenticates the credential and claimed job, consumes
 
 An `ask` approval is bound to job ID, tool name, canonical normalized-argument digest, lease expiry, and a host-generated one-time nonce. Request IDs are also consumed once to reject replay or argument mutation. The broker authenticates the lease again after the asynchronous answer, so cancellation or expiry wins the race and the operation is not invoked.
 
-Cancellation, timeout, creation rollback, disposal, and host shutdown revoke leases synchronously before container cleanup. Credentials cannot be replayed after revocation.
+Cancellation, timeout, creation rollback, disposal, and host shutdown revoke leases synchronously before container cleanup. Revocation also cancels any in-flight provider future, and the broker re-authenticates after invocation so late results are discarded. Credentials cannot be replayed after revocation.
 
 ## Audit records
 

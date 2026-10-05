@@ -17,6 +17,43 @@ fn config() -> (std::path::PathBuf, std::path::PathBuf) {
     (root, path)
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn native_runner_is_rejected_for_remote_ingress() {
+    let Some(node) = [
+        "/opt/homebrew/bin/node",
+        "/usr/local/bin/node",
+        "/usr/bin/node",
+    ]
+    .into_iter()
+    .find(|path| std::path::Path::new(path).is_file()) else {
+        return;
+    };
+    let root =
+        std::env::temp_dir().join(format!("pocket-agent-native-cli-{}", uuid::Uuid::new_v4()));
+    fs::create_dir_all(&root).unwrap();
+    let path = root.join("config.json");
+    let worker = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/docker-worker/worker.mjs");
+    fs::write(
+        &path,
+        format!(
+            r#"{{"signal":{{"account":"+1555","allowedSenders":["+1556"]}},"repositories":{{"app":"{}"}},"stateDir":"{}","sandbox":{{"runner":"native","nodePath":"{node}","workerPath":"{}"}},"agent":{{"model":"anthropic/model","apiKeyEnv":"POCKET_AGENT_TEST_DEFINITELY_MISSING_KEY"}}}}"#,
+            root.display(),
+            root.join("state").display(),
+            worker.display()
+        ),
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_pocket-agent"))
+        .args(["--config", path.to_str().unwrap(), "serve", "signal"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("local-interactive-only"));
+    let _ = fs::remove_dir_all(root);
+}
+
 #[test]
 fn signal_configuration_is_required_only_for_signal_ingress() {
     let (root, config) = config();

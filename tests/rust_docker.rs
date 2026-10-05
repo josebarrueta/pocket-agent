@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use pocket_agent::{
     capability::{CapabilityBroker, CapabilityLimits},
     docker::{DockerJobFactory, DockerJobFactoryConfig, DockerLimits},
-    domain::{ApprovalRequest, JobSpec},
+    domain::{ApprovalRequest, AuthorizationRequest, JobSpec},
     model_proxy::{ModelDescriptor, ModelProxy, ModelProxyLimits},
     ports::{JobEventPort, JobFactory, PrivateMount, WorkerAccessIssuer, WorkerLease},
     workspace::{WorkspaceLimits, WorkspaceManager},
@@ -60,6 +60,9 @@ impl JobEventPort for Events {
     }
     async fn request_approval(&self, _request: ApprovalRequest) -> Result<String> {
         Ok("no".into())
+    }
+    async fn authorization_required(&self, _request: AuthorizationRequest) -> Result<()> {
+        Ok(())
     }
 }
 

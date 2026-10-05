@@ -130,10 +130,10 @@ Every job worker must have:
 - denied general network egress, with only authenticated private broker/model endpoints;
 - a per-job identity and short-lived credentials;
 - runtime and protocol-output limits;
-- forced process-tree termination and capability revocation on cancellation, timeout, or failure;
+- capability revocation on cancellation, timeout, or failure, plus forced process-tree termination for production remote runners;
 - no unrestricted fallback when an isolation control is unavailable.
 
-The hardened Docker runner additionally provides a pinned read-only image, a non-root user, dropped capabilities, and CPU, memory, PID, open-file, and storage limits. Native OS runners must document weaker or platform-specific controls and may not claim Docker-equivalent isolation. The current macOS runner lacks equivalent CPU, memory, PID, and disk quotas.
+The hardened Docker runner additionally provides a pinned read-only image, a non-root user, dropped capabilities, and CPU, memory, PID, open-file, and storage limits. Native OS runners must document weaker or platform-specific controls and may not claim Docker-equivalent isolation. The current macOS runner lacks equivalent CPU, memory, PID, and disk quotas and cannot guarantee termination of descendants that escape its original process group; it is therefore local-interactive-only.
 
 MCP is the mediation protocol, not the isolation mechanism. The sandbox provides isolation; the broker provides narrowly scoped access through explicit capabilities. No runner provides “complete” isolation against compromise of its kernel, runtime, trusted host, or dependency supply chain.
 

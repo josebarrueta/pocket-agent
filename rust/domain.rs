@@ -81,6 +81,12 @@ pub enum HarnessEvent {
         detail: String,
         choices: Vec<String>,
     },
+    AuthorizationRequired {
+        job_id: String,
+        connector: String,
+        capability: String,
+        url: String,
+    },
     TurnCompleted {
         job_id: String,
         output: String,
@@ -135,4 +141,11 @@ pub struct ApprovalRequest {
     pub title: String,
     pub detail: String,
     pub choices: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuthorizationRequest {
+    pub connector: String,
+    pub capability: String,
+    pub url: String,
 }

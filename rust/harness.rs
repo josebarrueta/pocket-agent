@@ -12,8 +12,8 @@ use uuid::Uuid;
 
 use crate::{
     domain::{
-        ApprovalRequest, HarnessCommand, HarnessEvent, HarnessRequest, JobKind, JobSpec, JobState,
-        JobSummary,
+        ApprovalRequest, AuthorizationRequest, HarnessCommand, HarnessEvent, HarnessRequest,
+        JobKind, JobSpec, JobState, JobSummary,
     },
     ports::{JobEventPort, JobFactory, JobHandle, ReplyPort},
 };
@@ -186,6 +186,20 @@ impl JobEventPort for TurnEvents {
                 &self.job_id,
                 request,
                 &self.replies,
+            )
+            .await
+    }
+
+    async fn authorization_required(&self, request: AuthorizationRequest) -> Result<()> {
+        self.replies
+            .send(
+                &self.conversation_id,
+                HarnessEvent::AuthorizationRequired {
+                    job_id: self.job_id.clone(),
+                    connector: request.connector,
+                    capability: request.capability,
+                    url: request.url,
+                },
             )
             .await
     }

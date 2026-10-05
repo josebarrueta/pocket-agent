@@ -224,6 +224,18 @@ impl CliIngress {
                 self.send(HarnessCommand::Answer { request_id, answer }, replies)
                     .await?;
             }
+            HarnessEvent::AuthorizationRequired {
+                job_id,
+                connector,
+                capability,
+                url,
+            } => {
+                self.terminal
+                    .write(&format!(
+                        "[{job_id}] Authorization required for {connector}/{capability}. Open this URL, then explicitly retry the operation:\n{url}"
+                    ))
+                    .await?;
+            }
             HarnessEvent::TurnCompleted {
                 job_id,
                 output,

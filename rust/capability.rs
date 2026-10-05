@@ -18,12 +18,13 @@ use sha2::{Digest, Sha256};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{UnixListener, UnixStream},
+    sync::Notify,
     task::JoinHandle,
 };
 use uuid::Uuid;
 
 use crate::{
-    domain::{ApprovalRequest, JobSpec},
+    domain::{ApprovalRequest, AuthorizationRequest, JobSpec},
     ports::{JobEventPort, PrivateMount, WorkerAccessIssuer, WorkerLease},
     workspace::{WorkspaceManager, WorkspacePatchStatus},
 };
@@ -51,12 +52,64 @@ pub struct CapabilityContext {
     pub principal_id: String,
     pub conversation_id: String,
     pub repository: String,
-    pub events: Arc<Mutex<Option<Arc<dyn JobEventPort>>>>,
+    events: Arc<Mutex<Option<Arc<dyn JobEventPort>>>>,
+    revocation: Arc<RevocationSignal>,
+}
+
+impl CapabilityContext {
+    fn active_events(&self) -> Result<Arc<dyn JobEventPort>> {
+        self.events
+            .lock()
+            .expect("capability event lock")
+            .clone()
+            .ok_or_else(|| anyhow!("No active turn is available for this capability"))
+    }
+
+    pub async fn authorization_required(
+        &self,
+        connector: &str,
+        capability: &str,
+        url: &str,
+    ) -> Result<()> {
+        self.active_events()?
+            .authorization_required(AuthorizationRequest {
+                connector: connector.to_owned(),
+                capability: capability.to_owned(),
+                url: url.to_owned(),
+            })
+            .await
+    }
+}
+
+#[cfg(test)]
+impl CapabilityContext {
+    pub(crate) fn test(ingress_id: &str) -> Self {
+        Self::test_with_events(ingress_id, None)
+    }
+
+    pub(crate) fn test_with_events(
+        ingress_id: &str,
+        events: Option<Arc<dyn JobEventPort>>,
+    ) -> Self {
+        Self {
+            job_id: "job".into(),
+            ingress_id: ingress_id.into(),
+            principal_id: "principal".into(),
+            conversation_id: "conversation".into(),
+            repository: "app".into(),
+            events: Arc::new(Mutex::new(events)),
+            revocation: Arc::new(RevocationSignal::default()),
+        }
+    }
 }
 
 #[async_trait]
 pub trait CapabilityProvider: Send + Sync {
-    fn descriptors(&self, context: &CapabilityContext) -> Vec<CapabilityDescriptor>;
+    fn configured_descriptors(&self, context: &CapabilityContext) -> Vec<CapabilityDescriptor>;
+
+    async fn descriptors(&self, context: &CapabilityContext) -> Result<Vec<CapabilityDescriptor>> {
+        Ok(self.configured_descriptors(context))
+    }
     async fn normalize(
         &self,
         context: &CapabilityContext,
@@ -92,6 +145,32 @@ impl Default for CapabilityLimits {
     }
 }
 
+#[derive(Default)]
+struct RevocationSignal {
+    revoked: AtomicBool,
+    notify: Notify,
+}
+
+impl RevocationSignal {
+    fn revoke(&self) {
+        self.revoked.store(true, Ordering::SeqCst);
+        self.notify.notify_waiters();
+    }
+
+    async fn cancelled(&self) {
+        loop {
+            if self.revoked.load(Ordering::SeqCst) {
+                return;
+            }
+            let notified = self.notify.notified();
+            if self.revoked.load(Ordering::SeqCst) {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
 struct LeaseState {
     job_id: String,
     ingress_id: String,
@@ -102,6 +181,7 @@ struct LeaseState {
     calls: usize,
     request_ids: BTreeSet<String>,
     events: Arc<Mutex<Option<Arc<dyn JobEventPort>>>>,
+    revocation: Arc<RevocationSignal>,
 }
 
 pub struct CapabilityBroker {
@@ -196,7 +276,13 @@ impl CapabilityBroker {
 
     pub async fn close(&self) {
         self.started.store(false, Ordering::SeqCst);
-        self.leases.lock().expect("capability lease lock").clear();
+        {
+            let mut leases = self.leases.lock().expect("capability lease lock");
+            for lease in leases.values() {
+                lease.revocation.revoke();
+            }
+            leases.clear();
+        }
         if let Some(server) = self.server.lock().await.take() {
             server.abort();
         }
@@ -254,7 +340,7 @@ impl CapabilityBroker {
             }
             "tools/list" => {
                 let context = self.capability_context(&credential, job_id)?;
-                let descriptors = self.descriptors(&context)?;
+                let descriptors = self.descriptors(&context).await?;
                 Ok(
                     json!({ "jsonrpc": "2.0", "id": id, "result": { "tools": descriptors.into_iter().map(descriptor_json).collect::<Vec<_>>() } }),
                 )
@@ -311,7 +397,7 @@ impl CapabilityBroker {
             lease.calls += 1;
             context_from_lease(lease)
         };
-        let Some((provider, descriptor)) = self.provider_for(&context, name)? else {
+        let Some((provider, descriptor)) = self.provider_for(&context, name).await? else {
             self.audit(job_id, &context.repository, name, None, "forbidden")?;
             bail!("Capability is outside this job scope");
         };
@@ -324,12 +410,7 @@ impl CapabilityBroker {
         };
         let digest = canonical_digest(&normalized);
         if descriptor.policy == CapabilityPolicy::Ask {
-            let events = context
-                .events
-                .lock()
-                .expect("capability event lock")
-                .clone()
-                .ok_or_else(|| anyhow!("No active turn can approve this capability"))?;
+            let events = context.active_events()?;
             let approval = ApprovalRequest {
                 title: format!("Allow capability {name}?"),
                 detail: format!(
@@ -345,7 +426,17 @@ impl CapabilityBroker {
                 bail!("Capability was denied by operator");
             }
         }
-        let outcome = provider.invoke(&context, name, &normalized).await;
+        let outcome = tokio::select! {
+            outcome = provider.invoke(&context, name, &normalized) => outcome,
+            () = context.revocation.cancelled() => {
+                self.audit(job_id, &context.repository, name, Some(&digest), "revoked")?;
+                bail!("Capability credential was revoked during the call");
+            }
+        };
+        if self.authenticate(credential, job_id).is_err() {
+            self.audit(job_id, &context.repository, name, Some(&digest), "revoked")?;
+            bail!("Capability credential was revoked during the call");
+        }
         match outcome {
             Ok(value) => {
                 ensure!(
@@ -362,11 +453,11 @@ impl CapabilityBroker {
         }
     }
 
-    fn descriptors(&self, context: &CapabilityContext) -> Result<Vec<CapabilityDescriptor>> {
+    async fn descriptors(&self, context: &CapabilityContext) -> Result<Vec<CapabilityDescriptor>> {
         let mut names = BTreeSet::new();
         let mut descriptors = Vec::new();
         for provider in &self.providers {
-            for descriptor in provider.descriptors(context) {
+            for descriptor in provider.descriptors(context).await? {
                 ensure!(
                     names.insert(descriptor.name.clone()),
                     "Duplicate capability name"
@@ -377,7 +468,7 @@ impl CapabilityBroker {
         Ok(descriptors)
     }
 
-    fn provider_for(
+    async fn provider_for(
         &self,
         context: &CapabilityContext,
         name: &str,
@@ -385,7 +476,7 @@ impl CapabilityBroker {
         let mut found = None;
         for provider in &self.providers {
             if let Some(descriptor) = provider
-                .descriptors(context)
+                .configured_descriptors(context)
                 .into_iter()
                 .find(|descriptor| descriptor.name == name)
             {
@@ -450,6 +541,7 @@ impl WorkerAccessIssuer for CapabilityBroker {
         let credential = Uuid::new_v4().to_string();
         let key = credential_hash(&credential);
         let events = Arc::new(Mutex::new(None));
+        let revocation = Arc::new(RevocationSignal::default());
         self.leases.lock().expect("capability lease lock").insert(
             key.clone(),
             LeaseState {
@@ -462,6 +554,7 @@ impl WorkerAccessIssuer for CapabilityBroker {
                 calls: 0,
                 request_ids: BTreeSet::new(),
                 events: events.clone(),
+                revocation: revocation.clone(),
             },
         );
         Ok(vec![Arc::new(CapabilityLease {
@@ -470,6 +563,7 @@ impl WorkerAccessIssuer for CapabilityBroker {
             credential,
             socket: self.socket.clone(),
             events,
+            revocation,
             revoked: AtomicBool::new(false),
         })])
     }
@@ -481,6 +575,7 @@ struct CapabilityLease {
     credential: String,
     socket: PathBuf,
     events: Arc<Mutex<Option<Arc<dyn JobEventPort>>>>,
+    revocation: Arc<RevocationSignal>,
     revoked: AtomicBool,
 }
 
@@ -508,6 +603,7 @@ impl WorkerLease for CapabilityLease {
     }
     fn revoke(&self) {
         if !self.revoked.swap(true, Ordering::SeqCst) {
+            self.revocation.revoke();
             self.leases
                 .lock()
                 .expect("capability lease lock")
@@ -540,7 +636,7 @@ fn authenticate_locked<'a>(
 
 #[async_trait]
 impl CapabilityProvider for WorkspaceProvider {
-    fn descriptors(&self, _context: &CapabilityContext) -> Vec<CapabilityDescriptor> {
+    fn configured_descriptors(&self, _context: &CapabilityContext) -> Vec<CapabilityDescriptor> {
         vec![
             descriptor(
                 "workspace.read_metadata",
@@ -665,6 +761,7 @@ fn context_from_lease(lease: &LeaseState) -> CapabilityContext {
         conversation_id: lease.conversation_id.clone(),
         repository: lease.repository.clone(),
         events: lease.events.clone(),
+        revocation: lease.revocation.clone(),
     }
 }
 
@@ -789,11 +886,12 @@ fn http_json(status: u16, value: Value) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ports::JobEventPort;
+    use crate::{domain::AuthorizationRequest, ports::JobEventPort};
     use std::{
         process::Command,
         sync::atomic::{AtomicUsize, Ordering},
     };
+    use tokio::sync::{Notify, oneshot};
 
     struct Approvals(AtomicUsize);
     #[async_trait]
@@ -806,6 +904,59 @@ mod tests {
             self.0.fetch_add(1, Ordering::SeqCst);
             Ok("yes".into())
         }
+        async fn authorization_required(&self, _request: AuthorizationRequest) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    struct BlockingProvider {
+        started: Arc<Notify>,
+        dropped: Mutex<Option<oneshot::Sender<()>>>,
+    }
+
+    #[async_trait]
+    impl CapabilityProvider for BlockingProvider {
+        fn configured_descriptors(
+            &self,
+            _context: &CapabilityContext,
+        ) -> Vec<CapabilityDescriptor> {
+            vec![descriptor(
+                "test.blocking",
+                "Wait until the lease is revoked.",
+                json!({ "type": "object", "additionalProperties": false }),
+                CapabilityPolicy::Allow,
+            )]
+        }
+
+        async fn normalize(
+            &self,
+            _context: &CapabilityContext,
+            _capability: &str,
+            arguments: Value,
+        ) -> Result<Value> {
+            Ok(arguments)
+        }
+
+        async fn invoke(
+            &self,
+            _context: &CapabilityContext,
+            _capability: &str,
+            _arguments: &Value,
+        ) -> Result<Value> {
+            struct Dropped(Option<oneshot::Sender<()>>);
+            impl Drop for Dropped {
+                fn drop(&mut self) {
+                    if let Some(sender) = self.0.take() {
+                        let _ = sender.send(());
+                    }
+                }
+            }
+            let guard = Dropped(self.dropped.lock().unwrap().take());
+            self.started.notify_one();
+            std::future::pending::<()>().await;
+            drop(guard);
+            unreachable!()
+        }
     }
 
     fn git(path: &std::path::Path, arguments: &[&str]) {
@@ -817,6 +968,68 @@ mod tests {
                 .unwrap()
                 .success()
         );
+    }
+
+    #[tokio::test]
+    async fn revocation_cancels_an_in_flight_provider_call() {
+        let root = PathBuf::from("/tmp").join(format!("pa-cap-cancel-{}", Uuid::new_v4()));
+        let source = root.join("source");
+        fs::create_dir_all(&source).unwrap();
+        git(&source, &["init", "--quiet"]);
+        let workspaces = WorkspaceManager::new(
+            root.join("workspaces"),
+            BTreeMap::from([("app".into(), source)]),
+            Default::default(),
+        )
+        .unwrap();
+        let started = Arc::new(Notify::new());
+        let (dropped_tx, dropped_rx) = oneshot::channel();
+        let provider: Arc<dyn CapabilityProvider> = Arc::new(BlockingProvider {
+            started: started.clone(),
+            dropped: Mutex::new(Some(dropped_tx)),
+        });
+        let broker = CapabilityBroker::with_providers(
+            root.join("broker/broker.sock"),
+            root.join("audit/capabilities.ndjson"),
+            workspaces,
+            Default::default(),
+            vec![provider],
+        )
+        .unwrap();
+        broker.start().await.unwrap();
+        let spec = JobSpec {
+            job_id: "job-a".into(),
+            ingress_id: "test".into(),
+            principal_id: "user".into(),
+            conversation_id: "conversation".into(),
+            repository: "app".into(),
+        };
+        let leases = broker.issue(&spec).await.unwrap();
+        let credential = leases[0].environment()["POCKET_AGENT_MCP_CREDENTIAL"].clone();
+        let call = {
+            let broker = broker.clone();
+            tokio::spawn(async move {
+                broker
+                    .call(&credential, "job-a", "blocking", "test.blocking", json!({}))
+                    .await
+            })
+        };
+        started.notified().await;
+        leases[0].revoke();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), dropped_rx)
+                .await
+                .is_ok()
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), call)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_err()
+        );
+        broker.close().await;
+        let _ = fs::remove_dir_all(root);
     }
 
     #[tokio::test]
