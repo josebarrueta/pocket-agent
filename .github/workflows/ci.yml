@@ -59,7 +59,7 @@ jobs:
             --security-opt no-new-privileges \
             --pids-limit 64 \
             pocket-agent/worker:test --smoke-test)"
-          python3 -c 'import json,sys; value=json.loads(sys.argv[1]); assert value["ok"] and value["uid"] == 65532 and value["gid"] == 65532 and value["piVersion"] == "0.87.1"' "$output"
+          python3 -c 'import json,sys; value=json.loads(sys.argv[1]); assert value["ok"] and value["uid"] == 65532 and value["gid"] == 65532 and value["piVersion"] == "1.5.0"' "$output"
 
           if docker run --rm --read-only --tmpfs /tmp:rw,nosuid,nodev,noexec,size=16m --network none pocket-agent/worker:test sh; then
             echo "worker accepted a command-line entrypoint override" >&2
