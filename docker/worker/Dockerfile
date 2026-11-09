@@ -10,7 +10,7 @@ RUN npm ci --omit=dev --no-audit --no-fund \
 FROM ${NODE_IMAGE} AS runtime
 ARG TARGETARCH
 ARG IMAGE_REVISION=unknown
-ARG PI_VERSION=0.87.1
+ARG PI_VERSION=1.5.0
 
 # Keep OS packages reproducible by installing from an immutable Debian snapshot.
 RUN case "${TARGETARCH}" in amd64|arm64) ;; *) echo "unsupported worker architecture: ${TARGETARCH}" >&2; exit 1 ;; esac \

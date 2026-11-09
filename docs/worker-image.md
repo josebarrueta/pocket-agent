@@ -29,7 +29,7 @@ docker run --rm \
   pocket-agent/worker:test --smoke-test
 ```
 
-The smoke result must report UID/GID `65532`, Pi `0.87.1`, and protocol version `1`. The normal entrypoint accepts bounded newline-delimited JSON on standard input. It rejects malformed messages, unknown fields, unsupported versions, and command-line overrides. Session/settings state is in memory; only files written beneath the job workspace survive long enough to become a candidate patch.
+The smoke result must report UID/GID `65532`, Pi `1.5.0`, and protocol version `1`. The normal entrypoint accepts bounded newline-delimited JSON on standard input. It rejects malformed messages, unknown fields, unsupported versions, and command-line overrides. Session/settings state is in memory; only files written beneath the job workspace survive long enough to become a candidate patch.
 
 ## Provenance and inspection
 
